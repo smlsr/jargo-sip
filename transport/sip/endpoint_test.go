@@ -383,6 +383,134 @@ func TestStandaloneSTUNFailureReleasesSIP(t *testing.T) {
 	again.Close()
 }
 
+func TestCancelDuringSTUNReleasesPort(t *testing.T) {
+	peer := dropSTUN(t)
+	cfg := baseConfig()
+	cfg.NATMode = NATStandalone
+	cfg.AdvertiseIP = "203.0.113.10"
+	cfg.PortMap = PortMapSTUN
+	cfg.STUNServer = peer.LocalAddr().String()
+	cfg.SIPPort = freePort(t)
+	ep, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	errc := make(chan error, 1)
+	go func() {
+		errc <- ep.Start(parent)
+	}()
+	time.Sleep(150 * time.Millisecond)
+	cancelled := time.Now()
+	cancel()
+
+	select {
+	case err := <-errc:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Start err %v, want context canceled", err)
+		}
+		if waited := time.Since(cancelled); waited > time.Second {
+			t.Fatalf("Start returned %s after cancel", waited)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Start still blocked 1s after cancel")
+	}
+	again, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: cfg.SIPPort})
+	if err != nil {
+		t.Fatalf("sip port %d still held: %v", cfg.SIPPort, err)
+	}
+	again.Close()
+}
+
+func TestCloseDuringSTUNReleasesPort(t *testing.T) {
+	peer := dropSTUN(t)
+	cfg := baseConfig()
+	cfg.NATMode = NATStandalone
+	cfg.AdvertiseIP = "203.0.113.10"
+	cfg.PortMap = PortMapSTUN
+	cfg.STUNServer = peer.LocalAddr().String()
+	cfg.SIPPort = freePort(t)
+	ep, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	errc := make(chan error, 1)
+	go func() {
+		errc <- ep.Start(parent)
+	}()
+	time.Sleep(150 * time.Millisecond)
+	closed := time.Now()
+	if err := ep.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-errc:
+		if err == nil {
+			t.Fatal("Start succeeded after Close")
+		}
+		if waited := time.Since(closed); waited > time.Second {
+			t.Fatalf("Start returned %s after Close", waited)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Start still blocked 1s after Close")
+	}
+	again, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: cfg.SIPPort})
+	if err != nil {
+		t.Fatalf("sip port %d still held: %v", cfg.SIPPort, err)
+	}
+	again.Close()
+}
+
+func TestCancelDuringAllocateRTPReleasesPort(t *testing.T) {
+	box := newSTUNBox(t)
+	cfg := baseConfig()
+	cfg.NATMode = NATStandalone
+	cfg.AdvertiseIP = "203.0.113.10"
+	cfg.PortMap = PortMapSTUN
+	cfg.STUNServer = box.addr()
+	ep := startEP(t, cfg)
+	box.silence()
+
+	parent, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	type allocResult struct {
+		pair *RTPPair
+		err  error
+	}
+	out := make(chan allocResult, 1)
+	go func() {
+		pair, err := ep.AllocateRTP(parent)
+		out <- allocResult{pair, err}
+	}()
+	time.Sleep(150 * time.Millisecond)
+	cancelled := time.Now()
+	cancel()
+	select {
+	case got := <-out:
+		if !errors.Is(got.err, context.Canceled) {
+			t.Fatalf("AllocateRTP err %v, want context canceled", got.err)
+		}
+		if got.pair != nil {
+			t.Fatal("AllocateRTP returned a pair")
+		}
+		if waited := time.Since(cancelled); waited > time.Second {
+			t.Fatalf("AllocateRTP returned %s after cancel", waited)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("AllocateRTP still blocked 1s after cancel")
+	}
+	ep.mu.Lock()
+	held := len(ep.used)
+	ep.mu.Unlock()
+	if held != 0 {
+		t.Fatalf("%d RTP ports still reserved", held)
+	}
+}
+
 func TestStandaloneSTUNBindingPerRTPSocket(t *testing.T) {
 	box := newSTUNBox(t)
 	cfg := baseConfig()
@@ -486,10 +614,29 @@ type stunHit struct {
 	Tx   [12]byte
 }
 
+func dropSTUN(t *testing.T) *net.UDPConn {
+	t.Helper()
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		buf := make([]byte, 1500)
+		for {
+			if _, _, err := conn.ReadFromUDP(buf); err != nil {
+				return
+			}
+		}
+	}()
+	t.Cleanup(func() { _ = conn.Close() })
+	return conn
+}
+
 type stunBox struct {
-	conn *net.UDPConn
-	mu   sync.Mutex
-	hits []stunHit
+	conn   *net.UDPConn
+	mu     sync.Mutex
+	hits   []stunHit
+	silent bool
 }
 
 func newSTUNBox(t *testing.T) *stunBox {
@@ -506,6 +653,12 @@ func newSTUNBox(t *testing.T) *stunBox {
 
 func (b *stunBox) addr() string {
 	return b.conn.LocalAddr().String()
+}
+
+func (b *stunBox) silence() {
+	b.mu.Lock()
+	b.silent = true
+	b.mu.Unlock()
 }
 
 func (b *stunBox) serve() {
@@ -531,7 +684,11 @@ func (b *stunBox) serve() {
 		}
 		b.mu.Lock()
 		b.hits = append(b.hits, stunHit{Port: from.Port, Tx: tx})
+		silent := b.silent
 		b.mu.Unlock()
+		if silent {
+			continue
+		}
 		_, _ = b.conn.WriteToUDP(msg, from)
 	}
 }

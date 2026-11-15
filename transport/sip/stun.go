@@ -38,12 +38,18 @@ func resolveSTUN(server string) (*net.UDPAddr, error) {
 
 // binding sends one Binding request on conn and returns the mapped address
 // from that response. The result belongs to conn alone.
+//
+// The read deadline is the sooner of 2s and ctx's deadline. Cancel wakes the
+// read immediately with SetReadDeadline(time.Now()); closing conn does too.
 func binding(ctx context.Context, conn *net.UDPConn, server *net.UDPAddr) (net.IP, int, error) {
 	if ctx == nil {
 		return nil, 0, errors.New("nil context")
 	}
 	ctx, cancel := bindCtx(ctx)
 	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
 
 	raw, tx, err := newBindingRequest()
 	if err != nil {
@@ -52,11 +58,18 @@ func binding(ctx context.Context, conn *net.UDPConn, server *net.UDPAddr) (net.I
 	if _, err := conn.WriteToUDP(raw, server); err != nil {
 		return nil, 0, fmt.Errorf("stun binding: %w", err)
 	}
-	deadline, _ := ctx.Deadline()
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(2 * time.Second)
+	}
 	if err := conn.SetReadDeadline(deadline); err != nil {
 		return nil, 0, err
 	}
-	defer conn.SetReadDeadline(time.Time{})
+	stopWake := wakeOnCancel(ctx, conn)
+	defer func() {
+		stopWake()
+		_ = conn.SetReadDeadline(time.Time{})
+	}()
 
 	buf := make([]byte, 1500)
 	for {
@@ -69,6 +82,9 @@ func binding(ctx context.Context, conn *net.UDPConn, server *net.UDPAddr) (net.I
 				return nil, 0, ctx.Err()
 			}
 			return nil, 0, fmt.Errorf("stun binding: %w", err)
+		}
+		if ctx.Err() != nil {
+			return nil, 0, ctx.Err()
 		}
 		if from == nil || !from.IP.Equal(server.IP) || from.Port != server.Port {
 			continue
@@ -90,11 +106,30 @@ func binding(ctx context.Context, conn *net.UDPConn, server *net.UDPAddr) (net.I
 	}
 }
 
+// bindCtx limits one Binding exchange to 2s. WithTimeout's deadline is the
+// sooner of that cap and ctx's own deadline, and the returned cancel is live
+// even when ctx already has a deadline.
 func bindCtx(ctx context.Context) (context.Context, context.CancelFunc) {
-	if _, ok := ctx.Deadline(); ok {
-		return ctx, func() {}
-	}
 	return context.WithTimeout(ctx, 2*time.Second)
+}
+
+// wakeOnCancel unblocks a ReadFromUDP when ctx is done. stop waits until the
+// watcher has finished touching the socket.
+func wakeOnCancel(ctx context.Context, conn *net.UDPConn) (stop func()) {
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		select {
+		case <-ctx.Done():
+			_ = conn.SetReadDeadline(time.Now())
+		case <-done:
+		}
+	}()
+	return func() {
+		close(done)
+		<-finished
+	}
 }
 
 func newBindingRequest() ([]byte, [12]byte, error) {

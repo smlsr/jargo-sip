@@ -25,20 +25,22 @@ type Addresses struct {
 
 // Endpoint is one SIP port. Start binds it. AllocateRTP binds an RTP pair.
 type Endpoint struct {
-	mu       sync.Mutex
-	cfg      Config
-	starting bool
-	started  bool
-	closed   bool
-	sipUDP   *net.UDPConn
-	sipTCP   *net.TCPListener
-	addrs    Addresses
-	stun     *net.UDPAddr
-	bindIP   net.IP
-	rtpMin   int
-	rtpMax   int
-	used     map[int]struct{}
-	pairs    []*RTPPair
+	mu         sync.Mutex
+	cfg        Config
+	starting   bool
+	started    bool
+	closed     bool
+	sipUDP     *net.UDPConn
+	sipTCP     *net.TCPListener
+	pending    []*net.UDPConn
+	pendingTCP *net.TCPListener
+	addrs      Addresses
+	stun       *net.UDPAddr
+	bindIP     net.IP
+	rtpMin     int
+	rtpMax     int
+	used       map[int]struct{}
+	pairs      []*RTPPair
 }
 
 // New stores cfg. Start validates it and binds.
@@ -89,6 +91,10 @@ func (e *Endpoint) Start(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if err := e.holdBind(udp, tcp); err != nil {
+		return err
+	}
+	defer e.releaseBind(udp, tcp)
 	localIP, err := advertiseLocal(socketIP(udp, tcp))
 	if err != nil {
 		return err
@@ -180,17 +186,102 @@ func (e *Endpoint) Close() error {
 	}
 	e.closed = true
 	e.started = false
+	ownedUDP := e.sipUDP
+	ownedTCP := e.sipTCP
 	err := closeBind(e.sipUDP, e.sipTCP)
 	e.sipUDP = nil
 	e.sipTCP = nil
+	closedUDP := map[*net.UDPConn]bool{}
+	if ownedUDP != nil {
+		closedUDP[ownedUDP] = true
+	}
 	pairs := append([]*RTPPair(nil), e.pairs...)
 	for _, p := range pairs {
+		if p.RTP != nil {
+			closedUDP[p.RTP] = true
+		}
+		if p.RTCP != nil {
+			closedUDP[p.RTCP] = true
+		}
 		if cerr := p.closeLocked(); err == nil {
 			err = cerr
 		}
 	}
+	if e.pendingTCP != nil && e.pendingTCP != ownedTCP {
+		if cerr := e.pendingTCP.Close(); err == nil {
+			err = cerr
+		}
+	}
+	e.pendingTCP = nil
+	for _, c := range e.pending {
+		if c == nil || closedUDP[c] {
+			continue
+		}
+		if cerr := c.Close(); err == nil {
+			err = cerr
+		}
+	}
+	e.pending = nil
 	e.pairs = nil
 	return err
+}
+
+// holdBind publishes sockets Close must drop while Start is still inside STUN.
+func (e *Endpoint) holdBind(udp *net.UDPConn, tcp *net.TCPListener) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return errors.New("endpoint is closed")
+	}
+	if udp != nil {
+		e.pending = append(e.pending, udp)
+	}
+	e.pendingTCP = tcp
+	return nil
+}
+
+func (e *Endpoint) releaseBind(udp *net.UDPConn, tcp *net.TCPListener) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if udp != nil {
+		e.removePendingLocked(udp)
+	}
+	if tcp != nil && e.pendingTCP == tcp {
+		e.pendingTCP = nil
+	}
+}
+
+func (e *Endpoint) holdConns(cs ...*net.UDPConn) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed || !e.started {
+		return errors.New("endpoint is not started")
+	}
+	e.pending = append(e.pending, cs...)
+	return nil
+}
+
+func (e *Endpoint) releaseConns(cs ...*net.UDPConn) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, c := range cs {
+		e.removePendingLocked(c)
+	}
+}
+
+func (e *Endpoint) removePendingLocked(c *net.UDPConn) {
+	n := 0
+	for _, p := range e.pending {
+		if p == c {
+			continue
+		}
+		e.pending[n] = p
+		n++
+	}
+	for i := n; i < len(e.pending); i++ {
+		e.pending[i] = nil
+	}
+	e.pending = e.pending[:n]
 }
 
 func listenSIP(p prepared) (*net.UDPConn, *net.TCPListener, int, error) {

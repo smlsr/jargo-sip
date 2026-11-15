@@ -71,6 +71,10 @@ func (e *Endpoint) AllocateRTP(ctx context.Context) (*RTPPair, error) {
 	if err != nil {
 		return fail(err)
 	}
+	if err := e.holdConns(rtpConn, rtcpConn); err != nil {
+		return fail(err)
+	}
+	defer e.releaseConns(rtpConn, rtcpConn)
 
 	pair := &RTPPair{
 		RTP:           rtpConn,
