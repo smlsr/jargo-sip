@@ -72,6 +72,12 @@ func newSender(audio Format) (*sender, error) {
 	}, nil
 }
 
+func (s *sender) codecName() Codec {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.codec
+}
+
 func (s *sender) setCodec(audio Format) error {
 	if err := checkAudio(audio); err != nil {
 		return err

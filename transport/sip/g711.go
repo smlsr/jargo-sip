@@ -29,6 +29,18 @@ func encodePCM(c Codec, pcm []byte) ([]byte, error) {
 	}
 }
 
+// decodePayload turns one G.711 payload into 16-bit little-endian PCM at 8000 Hz.
+func decodePayload(c Codec, payload []byte) ([]byte, error) {
+	switch c {
+	case CodecPCMU:
+		return g711.DecodeULaw(payload), nil
+	case CodecPCMA:
+		return g711.DecodeALaw(payload), nil
+	default:
+		return nil, fmt.Errorf("codec %q is unknown", c)
+	}
+}
+
 // silencePayload is codec silence, not encoded PCM zeros.
 // µ-law silence is 0xFF. A-law silence is 0xD5.
 func silencePayload(c Codec) []byte {

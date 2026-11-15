@@ -47,7 +47,9 @@ type RegisterConfig struct {
 	Expires   time.Duration
 }
 
-// JitterConfig is stored for the media path. Defaults are 40ms, 20ms, and 200ms.
+// JitterConfig is the playout delay. Zero values become 40 ms, 20 ms, and
+// 200 ms. Start rounds each value up to a 20 ms frame and keeps
+// Min <= Target <= Max.
 type JitterConfig struct {
 	Target time.Duration
 	Min    time.Duration
@@ -113,15 +115,7 @@ func applyDefaults(cfg Config) Config {
 	if cfg.PortMap == "" {
 		cfg.PortMap = PortMapIdentity
 	}
-	if cfg.Jitter.Target == 0 {
-		cfg.Jitter.Target = 40 * time.Millisecond
-	}
-	if cfg.Jitter.Min == 0 {
-		cfg.Jitter.Min = 20 * time.Millisecond
-	}
-	if cfg.Jitter.Max == 0 {
-		cfg.Jitter.Max = 200 * time.Millisecond
-	}
+	cfg.Jitter = normalizeJitter(cfg.Jitter)
 	if cfg.DTMF.PayloadType == 0 {
 		cfg.DTMF.PayloadType = 101
 	}
@@ -146,4 +140,36 @@ func applyDefaults(cfg Config) Config {
 		cfg.RTCP.Interval = 5 * time.Second
 	}
 	return cfg
+}
+
+// normalizeJitter fills zeros and rounds up to the 20 ms playout frame.
+// Min is then lowered so it does not exceed Target, and Target is lowered
+// so it does not exceed Max.
+func normalizeJitter(j JitterConfig) JitterConfig {
+	if j.Target <= 0 {
+		j.Target = 40 * time.Millisecond
+	}
+	if j.Min <= 0 {
+		j.Min = 20 * time.Millisecond
+	}
+	if j.Max <= 0 {
+		j.Max = 200 * time.Millisecond
+	}
+	j.Target = roundUpFrame(j.Target)
+	j.Min = roundUpFrame(j.Min)
+	j.Max = roundUpFrame(j.Max)
+	if j.Target > j.Max {
+		j.Target = j.Max
+	}
+	if j.Min > j.Target {
+		j.Min = j.Target
+	}
+	return j
+}
+
+func roundUpFrame(d time.Duration) time.Duration {
+	if d%tickInterval == 0 {
+		return d
+	}
+	return (d/tickInterval + 1) * tickInterval
 }
