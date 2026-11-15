@@ -28,14 +28,15 @@ func (e *sipStatusError) Error() string {
 	return fmt.Sprintf("sip status %d %s", e.code, phrase(e.code))
 }
 
-// Dial places one INVITE. A 401 or 407 is retried once. A second challenge
+// Dial places one INVITE. headers are written on that INVITE and copied
+// onto its ACK and CANCEL. A 401 or 407 is retried once. A second challenge
 // fails the dial. A 183 with SDP plays early media. The Call is returned
 // after ACK on 200. ACK and CANCEL use the INVITE CSeq.
-func (e *Endpoint) Dial(ctx context.Context, uri string) (*Call, error) {
-	return e.dial(ctx, uri, "", nil)
+func (e *Endpoint) Dial(ctx context.Context, uri string, headers ...Header) (*Call, error) {
+	return e.dial(ctx, uri, "", nil, headers)
 }
 
-func (e *Endpoint) dial(ctx context.Context, rawURI, replaces string, progress func(code int, reason string)) (*Call, error) {
+func (e *Endpoint) dial(ctx context.Context, rawURI, replaces string, progress func(code int, reason string), headers []Header) (*Call, error) {
 	if ctx == nil {
 		return nil, errors.New("nil context")
 	}
@@ -68,6 +69,7 @@ func (e *Endpoint) dial(ctx context.Context, rawURI, replaces string, progress f
 		extraAck:   make(chan *sip.Request, 1),
 		prackSeen:  map[uint32]struct{}{},
 	}
+	d.storeHeaders(headers)
 	var call *Call
 	defer func() {
 		if call != nil {
@@ -77,6 +79,7 @@ func (e *Endpoint) dial(ctx context.Context, rawURI, replaces string, progress f
 		if d.id != "" {
 			e.dialogs.drop(d.id)
 		}
+		releaseDialogHeaders(d)
 		_ = pair.Close()
 	}()
 
@@ -94,6 +97,7 @@ func (e *Endpoint) dial(ctx context.Context, rawURI, replaces string, progress f
 	if err != nil {
 		return nil, err
 	}
+	d.stamp(req, nil)
 	d.mu.Lock()
 	d.invite = req
 	d.offer = offerOutInvite
@@ -430,6 +434,7 @@ func (d *dialog) learnResponse(res *sip.Response, invite *sip.Request) {
 	if res == nil || invite == nil {
 		return
 	}
+	d.noteArrived(res)
 	d.mu.Lock()
 	if d.localFrom == nil && invite.From() != nil {
 		d.localFrom = sip.HeaderClone(invite.From())
@@ -567,6 +572,7 @@ func (d *dialog) sendCancel(invite *sip.Request) error {
 		return errors.New("cancel is missing the invite")
 	}
 	cancel := cancelFrom(invite)
+	d.stamp(cancel, nil)
 	tx, err := d.ep.beginTx(context.Background(), cancel)
 	if err != nil {
 		return err
