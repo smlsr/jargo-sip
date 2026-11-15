@@ -55,8 +55,6 @@ type rtpAccept struct {
 
 type rtpSource struct {
 	addr *net.UDPAddr
-	ssrc uint32
-	set  bool
 	n    int
 }
 
@@ -71,6 +69,8 @@ type rtpLatch struct {
 	state      LatchState
 	audioPT    uint8
 	dtmfPT     int
+	ssrc       uint32
+	haveSSRC   bool
 	switched   bool
 	first      time.Time
 	since      time.Time
@@ -135,6 +135,8 @@ func (l *rtpLatch) retarget(sdp *net.UDPAddr) {
 	l.contradict = time.Time{}
 	l.active = ""
 	l.commitN = 0
+	l.ssrc = 0
+	l.haveSSRC = false
 	l.sources = map[string]*rtpSource{}
 	l.dropped = 0
 	l.logged = nil
@@ -153,25 +155,25 @@ func (l *rtpLatch) observe(b []byte, addr *net.UDPAddr, now time.Time) rtpAccept
 		return rtpAccept{}
 	}
 	key := addrKey(addr)
-	if l.state == LatchCommitted {
-		return l.committed(key, pkt, audio)
-	}
-	src := l.sources[key]
-	if src != nil && src.set && src.ssrc != pkt.SSRC {
+	// One SSRC for the session. A second SSRC is dropped before it is counted
+	// or allowed to take the one provisional switch.
+	if l.haveSSRC && pkt.SSRC != l.ssrc {
 		l.dropped++
 		l.logDrop(key, "ssrc")
 		return rtpAccept{}
 	}
+	if l.state == LatchCommitted {
+		return l.committed(key, pkt, audio)
+	}
+	src := l.sources[key]
 	if src == nil {
 		src = &rtpSource{addr: cloneUDP(addr)}
 		l.sources[key] = src
 	}
-	if !src.set {
-		src.ssrc = pkt.SSRC
-		src.set = true
-	}
 	src.n++
 	if l.state == LatchSDPTarget {
+		l.ssrc = pkt.SSRC
+		l.haveSSRC = true
 		l.become(key, src.addr, now)
 		l.first = now
 		return acceptOf(pkt, audio)
@@ -202,12 +204,6 @@ func (l *rtpLatch) committed(key string, pkt *rtp.Packet, audio bool) rtpAccept 
 	if key != l.active {
 		l.dropped++
 		l.logDrop(key, "committed")
-		return rtpAccept{}
-	}
-	src := l.sources[key]
-	if src != nil && src.set && src.ssrc != pkt.SSRC {
-		l.dropped++
-		l.logDrop(key, "ssrc")
 		return rtpAccept{}
 	}
 	return acceptOf(pkt, audio)

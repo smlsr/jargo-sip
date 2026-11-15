@@ -101,36 +101,51 @@ func TestRTPLatchQuietAndContradict(t *testing.T) {
 
 func TestRTPLatchSwitchesOnce(t *testing.T) {
 	sdp := udp("10.0.0.1", 10000)
-	l := newRTPLatch(LatchMatchAddress, nil, sdp, 0, -1)
 	now := time.Unix(1_700_000_000, 0)
 	a := udp("10.1.1.1", 40000)
 	b := udp("10.2.2.2", 40001)
 	c := udp("10.3.3.3", 40002)
+
+	foreign := newRTPLatch(LatchMatchAddress, nil, sdp, 0, -1)
+	foreign.observe(mustPkt(t, 1, 160, 1, 0, audio(160)), a, now)
+	got := foreign.observe(mustPkt(t, 1, 160, 2, 0, audio(160)), b, now.Add(10*time.Millisecond))
+	if got.ok {
+		t.Fatal("second SSRC was accepted")
+	}
+	foreign.observe(mustPkt(t, 2, 320, 2, 0, audio(160)), b, now.Add(20*time.Millisecond))
+	if foreign.snapshot() != LatchProvisional || foreign.dest().Port != 40000 {
+		t.Fatalf("foreign SSRC moved the latch to %s %s", foreign.snapshot(), foreign.dest())
+	}
+	if foreign.droppedCount() < 2 {
+		t.Fatalf("foreign SSRC dropped %d", foreign.droppedCount())
+	}
+
+	l := newRTPLatch(LatchMatchAddress, nil, sdp, 0, -1)
 	l.observe(mustPkt(t, 1, 160, 1, 0, audio(160)), a, now)
-	l.observe(mustPkt(t, 1, 160, 2, 0, audio(160)), b, now.Add(10*time.Millisecond))
+	l.observe(mustPkt(t, 1, 160, 1, 0, audio(160)), b, now.Add(10*time.Millisecond))
 	if l.dest().Port != 40000 {
 		t.Fatalf("switched early to %d", l.dest().Port)
 	}
-	l.observe(mustPkt(t, 2, 320, 2, 0, audio(160)), b, now.Add(20*time.Millisecond))
+	l.observe(mustPkt(t, 2, 320, 1, 0, audio(160)), b, now.Add(20*time.Millisecond))
 	if l.snapshot() != LatchProvisional || l.dest().Port != 40001 {
 		t.Fatalf("switch %s %s", l.snapshot(), l.dest())
 	}
 	for i := 0; i < 5; i++ {
-		l.observe(mustPkt(t, uint16(i+1), uint32(i)*160, 3, 0, audio(160)), c, now.Add(time.Duration(30+i)*time.Millisecond))
+		l.observe(mustPkt(t, uint16(i+1), uint32(i)*160, 1, 0, audio(160)), c, now.Add(time.Duration(30+i)*time.Millisecond))
 	}
 	if l.dest().Port != 40001 {
 		t.Fatalf("second switch to %d", l.dest().Port)
 	}
-	l.observe(mustPkt(t, 3, 480, 2, 0, audio(160)), b, now.Add(40*time.Millisecond))
-	l.observe(mustPkt(t, 4, 640, 2, 0, audio(160)), b, now.Add(50*time.Millisecond))
+	l.observe(mustPkt(t, 3, 480, 1, 0, audio(160)), b, now.Add(40*time.Millisecond))
+	l.observe(mustPkt(t, 4, 640, 1, 0, audio(160)), b, now.Add(50*time.Millisecond))
 	if l.snapshot() != LatchCommitted || l.dest().Port != 40001 {
 		t.Fatalf("commit %s %s", l.snapshot(), l.dest())
 	}
 
 	late := newRTPLatch(LatchMatchAddress, nil, sdp, 0, -1)
 	late.observe(mustPkt(t, 1, 160, 1, 0, audio(160)), a, now)
-	late.observe(mustPkt(t, 1, 160, 2, 0, audio(160)), b, now.Add(501*time.Millisecond))
-	late.observe(mustPkt(t, 2, 320, 2, 0, audio(160)), b, now.Add(520*time.Millisecond))
+	late.observe(mustPkt(t, 1, 160, 1, 0, audio(160)), b, now.Add(501*time.Millisecond))
+	late.observe(mustPkt(t, 2, 320, 1, 0, audio(160)), b, now.Add(520*time.Millisecond))
 	if late.dest().Port != 40000 {
 		t.Fatalf("switched after the window to %d", late.dest().Port)
 	}
