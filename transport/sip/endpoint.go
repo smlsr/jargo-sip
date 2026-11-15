@@ -41,6 +41,9 @@ type Endpoint struct {
 	rtpMax     int
 	used       map[int]struct{}
 	pairs      []*RTPPair
+	medias     []*Media
+	closeOnce  sync.Once
+	closeErr   error
 }
 
 // New stores cfg. Start validates it and binds.
@@ -178,14 +181,27 @@ func (e *Endpoint) Addresses() (Addresses, error) {
 }
 
 // Close releases the SIP sockets and any RTP pairs still held.
+// Media sessions on those pairs are stopped first.
 func (e *Endpoint) Close() error {
+	e.closeOnce.Do(func() {
+		e.closeErr = e.shutdown()
+	})
+	return e.closeErr
+}
+
+func (e *Endpoint) shutdown() error {
 	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.closed {
-		return nil
-	}
 	e.closed = true
 	e.started = false
+	medias := append([]*Media(nil), e.medias...)
+	e.medias = nil
+	e.mu.Unlock()
+	for _, m := range medias {
+		_ = m.Close()
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	ownedUDP := e.sipUDP
 	ownedTCP := e.sipTCP
 	err := closeBind(e.sipUDP, e.sipTCP)

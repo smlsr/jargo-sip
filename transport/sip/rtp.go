@@ -33,6 +33,7 @@ type RTPPair struct {
 	MappedRTCPPort int
 
 	released bool
+	media    *Media
 }
 
 // AllocateRTP binds the next even RTP port and the following RTCP port.
@@ -124,10 +125,17 @@ func (e *Endpoint) AllocateRTP(ctx context.Context) (*RTPPair, error) {
 	return pair, nil
 }
 
-// Close releases the pair's sockets and its ports.
+// Close stops the media session on the pair, then releases the sockets and ports.
 func (p *RTPPair) Close() error {
 	if p == nil || p.endpoint == nil {
 		return nil
+	}
+	p.endpoint.mu.Lock()
+	m := p.media
+	p.media = nil
+	p.endpoint.mu.Unlock()
+	if m != nil {
+		_ = m.Close()
 	}
 	p.endpoint.mu.Lock()
 	defer p.endpoint.mu.Unlock()

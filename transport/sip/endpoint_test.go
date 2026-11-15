@@ -121,6 +121,16 @@ func TestStartRefuses(t *testing.T) {
 			mutate: func(c *Config) { c.NATMode = "lan" },
 			want:   ErrNATMode,
 		},
+		{
+			name:   "unknown latch match",
+			mutate: func(c *Config) { c.Latch.Match = "any" },
+			want:   ErrLatchMatch,
+		},
+		{
+			name:   "allow rtp from name",
+			mutate: func(c *Config) { c.Latch.AllowRTPFrom = []string{"sbc.example"} },
+			want:   ErrAllowRTPFrom,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
