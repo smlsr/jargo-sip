@@ -25,6 +25,13 @@
 // Target of audio is buffered, or the oldest packet is older than Target.
 // A missing packet repeats the previous frame. Pipeline rates other than
 // 8000 build one audio/resample stream per direction; 8000 does not.
+// Stopped playout returns concealment instead of that caller audio.
 //
-// Dialogs and DTMF are not part of this package yet.
+// Inbound dialogs live on Endpoint. github.com/emiago/sipgo v1.7.3
+// (2026-11-10, c6c20f2df8a7) owns transactions and the dialog session.
+// Digest challenges use github.com/icholy/digest v1.2.0 (2026-07-28).
+// Accept takes one established call. The first INVITE starts media when
+// the ACK arrives. re-INVITE and UPDATE commit a media change when the
+// 200 is sent. 100rel state stays on the dialog. DTMF is not part of
+// this package yet.
 package sip

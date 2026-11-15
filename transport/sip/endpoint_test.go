@@ -131,6 +131,19 @@ func TestStartRefuses(t *testing.T) {
 			mutate: func(c *Config) { c.Latch.AllowRTPFrom = []string{"sbc.example"} },
 			want:   ErrAllowRTPFrom,
 		},
+		{
+			name:   "require auth without credentials",
+			mutate: func(c *Config) { c.RequireAuth = true },
+			want:   ErrRequireAuth,
+		},
+		{
+			name: "require auth with empty password",
+			mutate: func(c *Config) {
+				c.RequireAuth = true
+				c.Auth = &DigestAuth{Username: "bot", Password: "  "}
+			},
+			want: ErrRequireAuth,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

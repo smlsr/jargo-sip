@@ -41,6 +41,11 @@ func decodePayload(c Codec, payload []byte) ([]byte, error) {
 	}
 }
 
+// concealmentPCM is one 20 ms frame returned while playout is stopped.
+func concealmentPCM() []byte {
+	return make([]byte, frameBytes)
+}
+
 // silencePayload is codec silence, not encoded PCM zeros.
 // µ-law silence is 0xFF. A-law silence is 0xD5.
 func silencePayload(c Codec) []byte {

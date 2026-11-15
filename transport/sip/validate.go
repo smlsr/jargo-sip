@@ -24,6 +24,8 @@ var (
 	ErrLatchMatch = errors.New("Latch.Match is unknown")
 	// ErrAllowRTPFrom is returned when an AllowRTPFrom entry is not an IPv4 address.
 	ErrAllowRTPFrom = errors.New("AllowRTPFrom is not an IPv4 address")
+	// ErrRequireAuth is returned when RequireAuth is set without a password.
+	ErrRequireAuth = errors.New("RequireAuth needs a password")
 )
 
 type prepared struct {
@@ -118,6 +120,10 @@ func prepare(cfg Config) (prepared, error) {
 			return prepared{}, ErrPublicAdvertiseBehindSBC
 		}
 		cfg.PortMap = PortMapIdentity
+	}
+
+	if cfg.RequireAuth && (cfg.Auth == nil || strings.TrimSpace(cfg.Auth.Password) == "") {
+		return prepared{}, ErrRequireAuth
 	}
 
 	needsSTUN := cfg.NATMode == NATStandalone && (advertise == nil || cfg.PortMap == PortMapSTUN)

@@ -44,6 +44,7 @@ type Media struct {
 
 	mu         sync.Mutex
 	stopped    bool
+	playout    bool
 	sdpRTP     *net.UDPAddr
 	sdpRTCP    *net.UDPAddr
 	byeCount   int
@@ -98,6 +99,7 @@ func StartMedia(ctx context.Context, pair *RTPPair, remote RemoteMedia) (*Media,
 		cname:     params.cname,
 		stop:      make(chan struct{}),
 		kick:      make(chan struct{}, 1),
+		playout:   true,
 		sdpRTP:    cloneUDP(rtpAddr),
 		sdpRTCP:   cloneUDP(rtcpAddr),
 	}
@@ -136,12 +138,35 @@ func (m *Media) Close() error {
 
 // ReadPCM returns one 20 ms frame of 8000 Hz 16-bit little-endian PCM.
 // It blocks until that frame is due. A gap returns the previous frame and a
-// nil error. After Close it returns ErrMediaClosed.
+// nil error. Stopped playout returns concealment instead of caller audio.
+// After Close it returns ErrMediaClosed.
 func (m *Media) ReadPCM() ([]byte, error) {
 	if m == nil || m.play == nil {
 		return nil, ErrMediaClosed
 	}
+	m.mu.Lock()
+	stopped := m.stopped
+	on := m.playout
+	m.mu.Unlock()
+	if stopped {
+		return nil, ErrMediaClosed
+	}
+	if !on {
+		return concealmentPCM(), nil
+	}
 	return m.play.read()
+}
+
+// SetPlayout stops or restores caller audio. Stopping does not change the
+// jitter buffer. ReadPCM returns concealment until playout is restored.
+func (m *Media) SetPlayout(on bool) error {
+	if err := m.alive(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.playout = on
+	m.mu.Unlock()
+	return nil
 }
 
 // WritePCM queues 8000 Hz 16-bit little-endian PCM. The sender pulls 20 ms.
