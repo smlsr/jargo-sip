@@ -115,7 +115,15 @@ func TestDialEarlyAndFinalResponseHeaders(t *testing.T) {
 	body := earlyBodyString(u.rtpPort(), true)
 	go func() {
 		inv := u.waitMethod("INVITE", 2*time.Second)
-		u.respond(inv, 183, "Session Progress", body, map[string]string{"X-Early": "play"})
+		// 100rel makes the client PRACK before we send 200, so the 183 is
+		// recorded before the final response can overtake it.
+		u.respond(inv, 183, "Session Progress", body, map[string]string{
+			"Require": "100rel",
+			"RSeq":    "1",
+			"X-Early": "play",
+		})
+		pr := u.waitMethod("PRACK", 2*time.Second)
+		u.respond(pr, 200, "OK", "", nil)
 		u.respond(inv, 200, "OK", body, map[string]string{"X-Answer": "final"})
 		_ = u.waitMethod("ACK", 2*time.Second)
 	}()
