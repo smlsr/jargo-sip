@@ -189,6 +189,33 @@ func (m *Media) WritePCM(pcm []byte) error {
 	return m.send.writePCM(pcm)
 }
 
+// flushPCM puts every full frame already queued onto the RTP socket. The
+// 20 ms loop is about to stop, and a frame still queued would not go out.
+func (m *Media) flushPCM() {
+	if m == nil || m.send == nil || m.rtp == nil {
+		return
+	}
+	m.mu.Lock()
+	stopped := m.stopped
+	m.mu.Unlock()
+	if stopped {
+		return
+	}
+	dest := m.rtpLatch.dest()
+	if dest == nil {
+		return
+	}
+	for {
+		raw, err := m.send.takeQueuedPCM()
+		if err != nil || len(raw) == 0 {
+			return
+		}
+		if _, err := m.rtp.WriteToUDP(raw, dest); err != nil {
+			return
+		}
+	}
+}
+
 // ReadDTMF returns one event per press. The first end bit for
 // (SSRC, timestamp, event) emits it. A new timestamp emits the previous
 // press when that press never set the end bit. Retransmitted end packets

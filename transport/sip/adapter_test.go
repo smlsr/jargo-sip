@@ -146,21 +146,31 @@ func TestKeypadZeroThroughEleven(t *testing.T) {
 func TestEndFrameHangsUpAfterAudio(t *testing.T) {
 	a := startAudio(t, baseConfig())
 	call := testCall(t, a.m)
+	call.dlg.pair = a.m.pair
 	tr := NewTransport(call, audioParams(wireClock, wireClock))
 	left := disconnects(tr)
 	task := startOutput(t, tr)
 
+	const n = 8
 	pcm := bytes.Repeat([]byte{0x10, 0x20}, frameSamples)
-	task.QueueFrame(frames.NewOutputAudioRawFrame(pcm, wireClock, 1))
+	for range n {
+		task.QueueFrame(frames.NewOutputAudioRawFrame(pcm, wireClock, 1))
+	}
 	task.QueueFrame(frames.NewEndFrame())
 	want, err := encodePCM(CodecPCMU, pcm)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !awaitPayload(t, a.sink, want, 2*time.Second) {
-		t.Fatal("EndFrame hung up before the queued audio was written")
+	if got := countPayload(t, a.sink, want, n, 2*time.Second); got != n {
+		t.Fatalf("RTP carried %d of %d farewell frames", got, n)
 	}
 	waitDone(t, call, 2*time.Second)
+	a.m.send.mu.Lock()
+	queued := a.m.send.pcmLen()
+	a.m.send.mu.Unlock()
+	if queued != 0 {
+		t.Fatalf("%d farewell bytes were still queued after BYE", queued)
+	}
 	if tr.call != call {
 		t.Fatal("transport swapped the call")
 	}
@@ -170,20 +180,56 @@ func TestEndFrameHangsUpAfterAudio(t *testing.T) {
 func TestCancelFrameHangsUp(t *testing.T) {
 	a := startAudio(t, baseConfig())
 	call := testCall(t, a.m)
+	call.dlg.pair = a.m.pair
 	tr := NewTransport(call, audioParams(wireClock, wireClock))
 	left := disconnects(tr)
 	task := startOutput(t, tr)
 
+	pcm := bytes.Repeat([]byte{0x10, 0x20}, maxPCMQueue/2)
+	if err := call.WritePCM(pcm); err != nil {
+		t.Fatal(err)
+	}
 	started := time.Now()
 	task.QueueFrame(frames.NewCancelFrame())
 	waitDone(t, call, time.Second)
 	if time.Since(started) > time.Second {
 		t.Fatalf("cancel waited %s", time.Since(started))
 	}
+	a.m.send.mu.Lock()
+	queued := a.m.send.pcmLen()
+	a.m.send.mu.Unlock()
+	if queued == 0 {
+		t.Fatal("CancelFrame transmitted the queued audio")
+	}
 	if tr.call != call {
 		t.Fatal("transport swapped the call")
 	}
 	assertQuiet(t, left)
+}
+
+func TestAdapterUrgentDTMFCutsAheadOfPCM(t *testing.T) {
+	a := startAudio(t, baseConfig())
+	call := testCall(t, a.m)
+	tr := NewTransport(call, audioParams(wireClock, wireClock))
+	queued := bytes.Repeat([]byte{0x10, 0x20}, 2240)
+	if err := call.WritePCM(queued); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := tr.out.WriteDTMFNative(ctx, frames.NewOutputDTMFFrame(frames.KeypadFive)); err != nil {
+		t.Fatal(err)
+	}
+	ev, before := dtmfPlace(a.m.send, 5)
+	if !ev || before == 0 {
+		t.Fatalf("normal digit ev=%v pcm before=%d", ev, before)
+	}
+	if err := tr.out.WriteDTMFNative(ctx, frames.NewOutputDTMFUrgentFrame(frames.KeypadSix)); err != nil {
+		t.Fatal(err)
+	}
+	ev, before = dtmfPlace(a.m.send, 6)
+	if !ev || before != 0 {
+		t.Fatalf("urgent digit ev=%v pcm before=%d", ev, before)
+	}
 }
 
 func TestEarlyMediaFramesFirst(t *testing.T) {
@@ -346,29 +392,45 @@ func awaitPCMFrame(t *testing.T, got *inputFrames) []byte {
 	return nil
 }
 
-func awaitPayload(t *testing.T, sink *net.UDPConn, want []byte, d time.Duration) bool {
+func countPayload(t *testing.T, sink *net.UDPConn, want []byte, n int, d time.Duration) int {
 	t.Helper()
 	deadline := time.Now().Add(d)
-	for time.Now().Before(deadline) {
+	got := 0
+	for got < n && time.Now().Before(deadline) {
 		remain := time.Until(deadline)
 		if remain > 200*time.Millisecond {
 			remain = 200 * time.Millisecond
 		}
 		buf := make([]byte, 2048)
 		_ = sink.SetReadDeadline(time.Now().Add(remain))
-		n, _, err := sink.ReadFromUDP(buf)
-		if err != nil || n == 0 {
+		nn, _, err := sink.ReadFromUDP(buf)
+		if err != nil || nn == 0 {
 			continue
 		}
 		pkt := &rtp.Packet{}
-		if err := pkt.Unmarshal(buf[:n]); err != nil {
+		if err := pkt.Unmarshal(buf[:nn]); err != nil {
 			continue
 		}
 		if bytes.Equal(pkt.Payload, want) {
-			return true
+			got++
 		}
 	}
-	return false
+	return got
+}
+
+func dtmfPlace(s *sender, event uint8) (bool, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	before := 0
+	for _, it := range s.items {
+		if it.ev != nil && it.ev.event == event {
+			return true, before
+		}
+		if it.ev == nil {
+			before += len(it.pcm)
+		}
+	}
+	return false, before
 }
 
 func waitDone(t *testing.T, c *Call, d time.Duration) {

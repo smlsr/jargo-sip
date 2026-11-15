@@ -306,6 +306,25 @@ func (s *sender) marshal(pt uint8, marker bool, ts uint32, payload []byte) ([]by
 	return raw, nil
 }
 
+// takeQueuedPCM builds one RTP packet from PCM already queued, ahead of any
+// press. It does not invent silence. The caller writes the packet.
+func (s *sender) takeQueuedPCM() ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, ErrMediaClosed
+	}
+	if s.run != nil || s.forceSilence || s.pcmAhead() < frameBytes {
+		return nil, nil
+	}
+	pcm := s.takePCM()
+	if len(pcm) != frameBytes {
+		return nil, nil
+	}
+	s.gap = 0
+	return s.emitAudio(pcm)
+}
+
 // takePCM returns one 20 ms frame from PCM queued ahead of the next press.
 // A short tail stays queued. Hold does not consume it.
 func (s *sender) takePCM() []byte {

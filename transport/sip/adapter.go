@@ -262,9 +262,9 @@ func newOutput(c *Call, pipe *Pipeline, p transport.Params, closing *atomic.Bool
 	return out
 }
 
-// ProcessFrame lets the base drain queued audio on EndFrame, and skip that
-// wait on CancelFrame, then sends BYE. closing is set first so the watch
-// does not treat our Hangup as the client leaving.
+// ProcessFrame lets the base drain queued audio on EndFrame, sends that PCM
+// before BYE stops the sender, and on CancelFrame hangs up without that wait.
+// closing is set first so the watch does not treat our Hangup as the client leaving.
 func (out *outputTransport) ProcessFrame(ctx context.Context, f frames.Frame, dir processor.Direction) error {
 	if err := out.BaseOutput.ProcessFrame(ctx, f, dir); err != nil {
 		return err
@@ -273,7 +273,15 @@ func (out *outputTransport) ProcessFrame(ctx context.Context, f frames.Frame, di
 		return nil
 	}
 	switch f.(type) {
-	case *frames.EndFrame, *frames.CancelFrame:
+	case *frames.EndFrame:
+		// The base has already handed the farewell to WritePCM. Hangup closes
+		// the RTP pair and that stops the 20 ms loop, so those frames have to
+		// be on the socket before BYE.
+		if out.call != nil {
+			out.call.flushPCM()
+		}
+		out.bye(ctx)
+	case *frames.CancelFrame:
 		out.bye(ctx)
 	}
 	return nil
@@ -300,13 +308,13 @@ func (out *outputTransport) StartWriting(context.Context) error { return nil }
 // SupportsNativeDTMF reports that keys travel as telephone-event, not audio.
 func (out *outputTransport) SupportsNativeDTMF() bool { return true }
 
-// WriteDTMFNative maps keypad keys to events 0-11 and sends them with
-// Call.WriteDTMF. The base calls this immediately for an urgent frame and
-// only after queued audio for a normal frame.
+// WriteDTMFNative maps keypad keys to events 0-11. A normal frame waits
+// behind PCM already queued. An urgent frame is the next tick.
 func (out *outputTransport) WriteDTMFNative(ctx context.Context, f frames.DTMFOutput) error {
 	if out.call == nil {
 		return ErrMediaClosed
 	}
+	_, urgent := f.(*frames.OutputDTMFUrgentFrame)
 	for _, key := range f.Keys() {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -315,7 +323,13 @@ func (out *outputTransport) WriteDTMFNative(ctx context.Context, f frames.DTMFOu
 		if !ok {
 			continue
 		}
-		if err := out.call.WriteDTMF(DTMF{Event: ev}); err != nil {
+		var err error
+		if urgent {
+			err = out.call.WriteDTMFUrgent(DTMF{Event: ev})
+		} else {
+			err = out.call.WriteDTMF(DTMF{Event: ev})
+		}
+		if err != nil {
 			return err
 		}
 	}

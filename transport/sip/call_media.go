@@ -18,6 +18,29 @@ func (c *Call) WriteDTMF(ev DTMF) error {
 	return c.dlg.media.WriteDTMF(ev)
 }
 
+// WriteDTMFUrgent queues the event ahead of PCM so the next tick sends it.
+func (c *Call) WriteDTMFUrgent(ev DTMF) error {
+	if err := c.mediaUp(); err != nil {
+		return err
+	}
+	return c.dlg.media.WriteDTMFUrgent(ev)
+}
+
+// flushPCM writes every full frame already queued on the sender. Hangup closes
+// the RTP pair, and that stops the 20 ms loop, so a farewell still in the
+// queue would never leave.
+func (c *Call) flushPCM() {
+	if c == nil || c.dlg == nil || c.dlg.media == nil {
+		return
+	}
+	select {
+	case <-c.done:
+		return
+	default:
+	}
+	c.dlg.media.flushPCM()
+}
+
 func (c *Call) mediaUp() error {
 	if c == nil || c.dlg == nil || c.dlg.media == nil {
 		return ErrMediaClosed
