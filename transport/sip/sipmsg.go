@@ -13,6 +13,12 @@ func (e *Endpoint) supportedValue() string {
 	return "100rel"
 }
 
+// timerSupported is Supported on the original INVITE, on OPTIONS, and on a
+// 200 that echoes a session timer. Other responses stay on 100rel.
+func timerSupported() sip.Header {
+	return sip.NewHeader("Supported", "100rel, timer")
+}
+
 func (e *Endpoint) supportedHeader() sip.Header {
 	return sip.NewHeader("Supported", e.supportedValue())
 }

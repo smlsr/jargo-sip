@@ -85,6 +85,7 @@ func (e *Endpoint) dial(ctx context.Context, rawURI, replaces string, progress f
 		return nil, err
 	}
 	d.storeSDP(raw)
+	d.timerOffer = sessionSeconds(e.cfg.SessionTimer)
 	seq, err := d.nextCSeq(sip.INVITE)
 	if err != nil {
 		return nil, err
@@ -137,7 +138,12 @@ func (e *Endpoint) inviteRequest(target sip.Uri, body []byte, seq uint32, replac
 	req.AppendHeader(&max)
 	req.AppendHeader(sip.HeaderClone(&e.contact))
 	req.AppendHeader(e.allowHeader())
-	req.AppendHeader(e.supportedHeader())
+	if secs := sessionSeconds(e.cfg.SessionTimer); secs > 0 {
+		req.AppendHeader(timerSupported())
+		req.AppendHeader(sip.NewHeader("Session-Expires", fmt.Sprintf("%d;refresher=uac", secs)))
+	} else {
+		req.AppendHeader(e.supportedHeader())
+	}
 	if replaces != "" {
 		req.AppendHeader(sip.NewHeader("Replaces", replaces))
 	}
@@ -169,7 +175,29 @@ func (e *Endpoint) localFrom() *sip.FromHeader {
 
 func (d *dialog) waitInvite(ctx context.Context, tx sip.ClientTransaction, invite *sip.Request, offered Description, progress func(int, string)) (*Call, error) {
 	authTries := 0
+	seTries := 0
 	saw1xx := false
+	resend := func() (sip.ClientTransaction, error) {
+		seq, err := d.nextCSeq(sip.INVITE)
+		if err != nil {
+			return nil, err
+		}
+		if cseq := invite.CSeq(); cseq != nil {
+			cseq.SeqNo = seq
+			cseq.MethodName = sip.INVITE
+		}
+		invite.RemoveHeader("Via")
+		tx.Terminate()
+		next, err := d.ep.beginTx(ctx, invite, sipgo.ClientRequestAddVia)
+		if err != nil {
+			return nil, err
+		}
+		d.mu.Lock()
+		d.invite = invite
+		d.inviteTx = next
+		d.mu.Unlock()
+		return next, nil
+	}
 	for {
 		var res *sip.Response
 		ended := false
@@ -234,6 +262,20 @@ func (d *dialog) waitInvite(ctx context.Context, tx sip.ClientTransaction, invit
 			tx = next
 			continue
 		}
+		if res.StatusCode == 422 && seTries < 1 && d.timerOffer > 0 {
+			if minSE := parseMinSE(res); minSE > d.timerOffer {
+				seTries++
+				d.timerOffer = minSE
+				invite.RemoveHeader("Session-Expires")
+				invite.AppendHeader(sip.NewHeader("Session-Expires", fmt.Sprintf("%d;refresher=uac", minSE)))
+				next, err := resend()
+				if err != nil {
+					return nil, err
+				}
+				tx = next
+				continue
+			}
+		}
 		if res.StatusCode != sip.StatusOK {
 			return nil, &sipStatusError{code: res.StatusCode}
 		}
@@ -244,6 +286,7 @@ func (d *dialog) waitInvite(ctx context.Context, tx sip.ClientTransaction, invit
 			_ = d.sendBye(context.Background())
 			return nil, err
 		}
+		d.adoptOutboundSession(res)
 		return d.publish(), nil
 	}
 }
@@ -379,6 +422,7 @@ func (d *dialog) publish() *Call {
 			_ = call.Hangup(context.Background())
 		})
 	}
+	d.armStoredSession()
 	return call
 }
 
