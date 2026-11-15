@@ -410,6 +410,23 @@ func TestAudioTimestampCompletesOpenPress(t *testing.T) {
 	}
 }
 
+func TestOlderAudioTimestampLeavesPressOpen(t *testing.T) {
+	m, _ := newSession(t, baseConfig(), nil)
+	injectAt(t, m, eventPkt(t, 1, 8000, 101, 5, false, 160, false))
+	injectAt(t, m, mustPkt(t, 2, 6400, 42, 0, bytes.Repeat([]byte{0x11}, frameSamples)))
+	if m.tones.pending() != 0 {
+		t.Fatal("older audio timestamp completed the press")
+	}
+	injectAt(t, m, eventPkt(t, 3, 8000, 101, 5, true, 1280, false))
+	ev, ok := awaitDTMF(t, m, time.Second)
+	if !ok || ev.Event != 5 || ev.Duration != 160*time.Millisecond {
+		t.Fatalf("end after late audio %+v ok %v", ev, ok)
+	}
+	if m.tones.pending() != 0 {
+		t.Fatal("end after late audio emitted twice")
+	}
+}
+
 func TestReadDTMFMarkerNotRequired(t *testing.T) {
 	m, _ := newSession(t, baseConfig(), nil)
 	injectAt(t, m, eventPkt(t, 1, 1000, 101, 5, true, 160, true))

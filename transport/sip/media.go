@@ -395,8 +395,8 @@ func (m *Media) takeRTP(b []byte, addr *net.UDPAddr, now time.Time) {
 
 func (m *Media) ingest(acc rtpAccept, now time.Time) {
 	if acc.audio {
-		// Audio has its own RTP timestamp. A timestamp other than the open
-		// press completes that press when the end bit never arrived.
+		// Audio has its own RTP timestamp. A newer timestamp completes an
+		// open press when the end bit never arrived. An older one does not.
 		if m.tones != nil {
 			m.tones.noteTimestamp(acc.ssrc, acc.ts)
 		}

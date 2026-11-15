@@ -150,7 +150,8 @@ func (d *dtmfRecv) observe(ssrc, ts uint32, payload []byte) {
 }
 
 // noteTimestamp completes an open press when a later RTP packet, including
-// audio, carries a different timestamp. The packet is not itself a digit.
+// audio, carries a newer timestamp. An older timestamp is late media and
+// leaves the press open. The packet is not itself a digit.
 func (d *dtmfRecv) noteTimestamp(ssrc, ts uint32) {
 	if d == nil {
 		return
@@ -160,10 +161,17 @@ func (d *dtmfRecv) noteTimestamp(ssrc, ts uint32) {
 	if d.closed || !d.on || d.cur == nil {
 		return
 	}
-	if d.cur.key.ssrc != ssrc || d.cur.key.ts == ts {
+	if d.cur.key.ssrc != ssrc || !timestampAfter(ts, d.cur.key.ts) {
 		return
 	}
 	d.finishOpen()
+}
+
+// timestampAfter reports whether a is later than b on the RTP clock.
+// The comparison is the RFC 3550 signed 32-bit difference, so a wrapped
+// timestamp still counts as later and an older one does not.
+func timestampAfter(a, b uint32) bool {
+	return int32(a-b) > 0
 }
 
 func (d *dtmfRecv) finishOpen() {
