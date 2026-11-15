@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"net"
 	"sync"
+
+	"github.com/emiago/sipgo"
+	"github.com/emiago/sipgo/sip"
 )
 
 // Addresses is the bound SIP socket and the address the endpoint advertises.
@@ -44,11 +47,33 @@ type Endpoint struct {
 	medias     []*Media
 	closeOnce  sync.Once
 	closeErr   error
+
+	root       context.Context
+	rootCancel context.CancelFunc
+	sipUA      *sipgo.UserAgent
+	sipCli     *sipgo.Client
+	contact    sip.ContactHeader
+	listen     sip.Addr
+	dialogs    *dialogTable
+	serveWG    sync.WaitGroup
+
+	acceptMu     sync.Mutex
+	accepted     []*Call
+	acceptClosed bool
+	acceptNotify chan struct{}
+
+	// beforeFinal runs after an inbound offer is reserved and before its
+	// final response. Tests use it to inject a second request.
+	beforeFinal func(*dialog, *sip.Request)
 }
 
 // New stores cfg. Start validates it and binds.
 func New(cfg Config) (*Endpoint, error) {
-	return &Endpoint{cfg: cfg}, nil
+	return &Endpoint{
+		cfg:          cfg,
+		dialogs:      newDialogTable(),
+		acceptNotify: make(chan struct{}),
+	}, nil
 }
 
 // Start checks cfg, binds the SIP transports, and resolves the advertised address.
@@ -159,6 +184,15 @@ func (e *Endpoint) Start(ctx context.Context) error {
 		MappedIP:         cloneIP(mappedIP),
 		MappedSIPPort:    mappedPort,
 	}
+	root, cancel := context.WithCancel(context.Background())
+	e.root = root
+	e.rootCancel = cancel
+	if err := e.openSIP(advIP, advPort, udp, tcp); err != nil {
+		cancel()
+		e.root = nil
+		e.rootCancel = nil
+		return err
+	}
 	e.started = true
 	e.starting = false
 	owned = true
@@ -184,7 +218,10 @@ func (e *Endpoint) Addresses() (Addresses, error) {
 // Media sessions on those pairs are stopped first.
 func (e *Endpoint) Close() error {
 	e.closeOnce.Do(func() {
+		e.hangupAll()
 		e.closeErr = e.shutdown()
+		e.serveWG.Wait()
+		e.wakeAcceptClosed()
 	})
 	return e.closeErr
 }
@@ -193,9 +230,18 @@ func (e *Endpoint) shutdown() error {
 	e.mu.Lock()
 	e.closed = true
 	e.started = false
+	if e.rootCancel != nil {
+		e.rootCancel()
+	}
+	ua := e.sipUA
+	e.sipUA = nil
+	e.sipCli = nil
 	medias := append([]*Media(nil), e.medias...)
 	e.medias = nil
 	e.mu.Unlock()
+	if ua != nil {
+		_ = ua.Close()
+	}
 	for _, m := range medias {
 		_ = m.Close()
 	}

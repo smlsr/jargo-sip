@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -131,6 +133,19 @@ func TestStartRefuses(t *testing.T) {
 			mutate: func(c *Config) { c.Latch.AllowRTPFrom = []string{"sbc.example"} },
 			want:   ErrAllowRTPFrom,
 		},
+		{
+			name:   "require auth without credentials",
+			mutate: func(c *Config) { c.RequireAuth = true },
+			want:   ErrRequireAuth,
+		},
+		{
+			name: "require auth with empty password",
+			mutate: func(c *Config) {
+				c.RequireAuth = true
+				c.Auth = &DigestAuth{Username: "bot", Password: "  "}
+			},
+			want: ErrRequireAuth,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -230,24 +245,25 @@ func TestBehindSBCBindsLocal(t *testing.T) {
 		t.Fatalf("latch %s", ep.cfg.Latch.Match)
 	}
 
-	probe := []byte("ping")
 	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: a.LocalSIPPort}
 	c, err := net.DialUDP("udp", nil, dst)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	if _, err := c.Write(probe); err != nil {
+	src := c.LocalAddr().(*net.UDPAddr)
+	probe := fmt.Sprintf("OPTIONS sip:bot@127.0.0.1:%d SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:%d;branch=z9hG4bKbind;rport\r\nFrom: <sip:alice@sip.example.com>;tag=bind\r\nTo: <sip:bot@sip.example.com>\r\nCall-ID: bind@127.0.0.1\r\nCSeq: 1 OPTIONS\r\nMax-Forwards: 70\r\nContent-Length: 0\r\n\r\n", a.LocalSIPPort, src.Port)
+	if _, err := c.Write([]byte(probe)); err != nil {
 		t.Fatal(err)
 	}
-	_ = ep.sipUDP.SetReadDeadline(time.Now().Add(time.Second))
-	buf := make([]byte, 16)
-	n, _, err := ep.sipUDP.ReadFromUDP(buf)
+	_ = c.SetReadDeadline(time.Now().Add(time.Second))
+	buf := make([]byte, 1500)
+	n, err := c.Read(buf)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(buf[:n]) != "ping" {
-		t.Fatalf("sip payload %q", buf[:n])
+	if !strings.Contains(string(buf[:n]), "SIP/2.0 405") {
+		t.Fatalf("sip response %q", buf[:n])
 	}
 
 	tcp, err := net.DialTimeout("tcp", ep.sipTCP.Addr().String(), time.Second)
