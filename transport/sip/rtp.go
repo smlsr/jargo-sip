@@ -83,7 +83,7 @@ func (e *Endpoint) AllocateRTP(ctx context.Context) (*RTPPair, error) {
 	pair := &RTPPair{
 		RTP:           rtpConn,
 		RTCP:          rtcpConn,
-		LocalIP:       cloneIP(socketIP(rtpConn, nil)),
+		LocalIP:       cloneIP(socketIP(rtpConn, nil, nil)),
 		LocalRTPPort:  localRTP,
 		LocalRTCPPort: localRTCP,
 		AdvertiseIP:   advIP,

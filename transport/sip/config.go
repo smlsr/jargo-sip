@@ -75,6 +75,20 @@ type RTCPConfig struct {
 	Interval time.Duration
 }
 
+// TLSConfig is the SIP TLS listener certificate and the outbound
+// verification policy. Start requires it when Transports contains tls.
+// CertFile and KeyFile are used as given when both are set. SelfSigned
+// generates a certificate for the advertised name when those files are
+// empty. IgnoreCertWarnings, when set, makes outbound TLS accept a peer
+// certificate that fails verification, including a self-signed peer.
+// When it is unset, verification stays on.
+type TLSConfig struct {
+	CertFile           string
+	KeyFile            string
+	SelfSigned         bool
+	IgnoreCertWarnings bool
+}
+
 // Config is the endpoint configuration. Start validates it and binds.
 type Config struct {
 	NATMode      NATMode
@@ -87,6 +101,7 @@ type Config struct {
 	DisplayName  string
 	SIPPort      int // default 5060
 	Transports   []string
+	TLS          *TLSConfig
 	RTPPortMin   int // default 10000
 	RTPPortMax   int // default 20000, even span
 	Auth         *DigestAuth
