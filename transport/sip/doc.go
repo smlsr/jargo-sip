@@ -39,4 +39,9 @@
 // Accept takes one established call. The first INVITE starts media when
 // the ACK arrives. re-INVITE and UPDATE commit a media change when the
 // 200 is sent. 100rel state stays on the dialog. Supported is 100rel.
+//
+// Dial sends one INVITE. A 401 or 407 is answered once. A 183 with SDP
+// starts early media. ACK and CANCEL copy the INVITE CSeq. Blind REFER
+// and attended REFER with Replaces end the original dialog on NOTIFY 200.
+// OnReplaced runs before that dialog's Done channel closes.
 package sip

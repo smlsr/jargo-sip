@@ -155,22 +155,38 @@ func phrase(code int) string {
 		return "Trying"
 	case sip.StatusRinging:
 		return "Ringing"
+	case sip.StatusSessionInProgress:
+		return "Session Progress"
 	case sip.StatusOK:
 		return "OK"
+	case sip.StatusAccepted:
+		return "Accepted"
 	case sip.StatusBadRequest:
 		return "Bad Request"
 	case sip.StatusUnauthorized:
 		return "Unauthorized"
 	case sip.StatusForbidden:
 		return "Forbidden"
+	case sip.StatusProxyAuthRequired:
+		return "Proxy Authentication Required"
+	case sip.StatusRequestTimeout:
+		return "Request Timeout"
+	case sip.StatusBusyHere:
+		return "Busy Here"
 	case sip.StatusCallTransactionDoesNotExists:
 		return "Call/Transaction Does Not Exist"
+	case sip.StatusRequestTerminated:
+		return "Request Terminated"
 	case sip.StatusNotAcceptableHere:
 		return "Not Acceptable Here"
+	case 489:
+		return "Bad Event"
 	case sip.StatusRequestPending:
 		return "Request Pending"
 	case sip.StatusInternalServerError:
 		return "Server Internal Error"
+	case sip.StatusServiceUnavailable:
+		return "Service Unavailable"
 	default:
 		return "Response"
 	}

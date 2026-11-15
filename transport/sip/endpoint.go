@@ -65,6 +65,8 @@ type Endpoint struct {
 	// beforeFinal runs after an inbound offer is reserved and before its
 	// final response. Tests use it to inject a second request.
 	beforeFinal func(*dialog, *sip.Request)
+
+	onReplaced func(old, new *Call)
 }
 
 // New stores cfg. Start validates it and binds.
