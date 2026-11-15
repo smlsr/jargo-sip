@@ -7,6 +7,9 @@ import (
 	"net"
 )
 
+// ErrPortsExhausted is returned when every even port in the configured range is in use.
+var ErrPortsExhausted = errors.New("RTP port range is exhausted")
+
 // RTPPair is one RTP socket and its RTCP socket (local port + 1).
 // Advertise ports are the local ports, or each socket's STUN mapped port
 // when PortMap is stun.
@@ -180,8 +183,8 @@ func (e *Endpoint) reserve(skip map[int]bool) (int, error) {
 	if e.closed || !e.started {
 		return 0, errors.New("endpoint is not started")
 	}
-	for p := e.rtpMin; p+1 <= e.rtpMax; p += 2 {
-		if skip[p] {
+	for p := e.rtpMin; p <= e.rtpMax; p += 2 {
+		if p+1 > 65535 || skip[p] {
 			continue
 		}
 		if _, ok := e.used[p]; ok {
@@ -194,7 +197,7 @@ func (e *Endpoint) reserve(skip map[int]bool) (int, error) {
 		e.used[p+1] = struct{}{}
 		return p, nil
 	}
-	return 0, errors.New("RTP port range is exhausted")
+	return 0, ErrPortsExhausted
 }
 
 func (e *Endpoint) release(port int) {
