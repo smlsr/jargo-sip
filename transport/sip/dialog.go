@@ -214,15 +214,17 @@ type dialog struct {
 	extraAck   chan *sip.Request
 
 	// Outbound INVITE and REFER.
-	uac        bool
-	finalSent  bool
-	holdFinish bool
-	referBusy  bool
-	invite     *sip.Request
-	inviteTx   sip.ClientTransaction
-	client     *sipgo.DialogClientSession
-	prackSeen  map[uint32]struct{}
-	notes      chan referNote
+	uac          bool
+	finalSent    bool
+	holdFinish   bool
+	referByeSeq  uint32
+	referByeBase uint32
+	referBusy    bool
+	invite       *sip.Request
+	inviteTx     sip.ClientTransaction
+	client       *sipgo.DialogClientSession
+	prackSeen    map[uint32]struct{}
+	notes        chan referNote
 }
 
 func newDialog(ep *Endpoint, sess *sipgo.DialogServerSession) (*dialog, error) {

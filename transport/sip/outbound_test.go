@@ -333,6 +333,36 @@ func TestDialBadEarlyMediaCancels(t *testing.T) {
 	}
 }
 
+func TestDialBadReliable183PracksThenCancels(t *testing.T) {
+	ep := startEP(t, baseConfig())
+	u := newUAS(t)
+	go func() {
+		inv := u.waitMethod("INVITE", 2*time.Second)
+		invSeq, _ := inv.cseq()
+		u.respond(inv, 183, "Session Progress", "this is not sdp\r\n", map[string]string{
+			"Require": "100rel",
+			"RSeq":    "1",
+		})
+		pr := u.waitMethod("PRACK", 2*time.Second)
+		if pr.hdr("rack") != fmt.Sprintf("1 %d INVITE", invSeq) {
+			t.Errorf("RAck %q", pr.hdr("rack"))
+		}
+		u.respond(pr, 200, "OK", "", nil)
+		got := u.waitMethod("CANCEL", 2*time.Second)
+		seq, method := got.cseq()
+		if method != "CANCEL" || seq != invSeq {
+			t.Errorf("cancel cseq %d %s, invite %d", seq, method, invSeq)
+		}
+		u.respond(got, 200, "OK", "", nil)
+		u.respond(inv, 487, "Request Terminated", "", nil)
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, err := ep.Dial(ctx, u.uri()); err == nil {
+		t.Fatal("unparseable reliable 183 returned a call")
+	}
+}
+
 func TestDialTimeoutSendsCancel(t *testing.T) {
 	prev1, prev2, prev4 := sip.T1, sip.T2, sip.T4
 	sip.SetTimers(time.Millisecond, 4*time.Millisecond, 5*time.Millisecond)
@@ -690,6 +720,92 @@ func TestReferNotifySurvivesBye(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("original call stayed up")
 	}
+}
+
+func TestReferStaleNotifyDoesNotEndCall(t *testing.T) {
+	ep := startEP(t, baseConfig())
+	u := newUAS(t)
+	go func() {
+		inv := u.waitMethod("INVITE", 2*time.Second)
+		u.respond(inv, 200, "OK", earlyBodyString(u.rtpPort(), true), nil)
+		_ = u.waitMethod("ACK", 2*time.Second)
+		ref := u.waitMethod("REFER", 2*time.Second)
+		u.respond(ref, 202, "Accepted", "", map[string]string{"Expires": "30"})
+		u.inDialog(ref, "UPDATE", 5, "", nil)
+		if resp := u.waitCode(200, "UPDATE", 2*time.Second); resp.code != 200 {
+			t.Errorf("update response %d", resp.code)
+		}
+		u.inDialog(ref, "NOTIFY", 2, "SIP/2.0 200 OK\r\n", map[string]string{
+			"Event":              "refer",
+			"Subscription-State": "terminated;reason=noresource",
+			"Content-Type":       "message/sipfrag;version=2.0",
+		})
+		if resp := u.waitCode(500, "NOTIFY", 2*time.Second); resp.code != 500 {
+			t.Errorf("stale notify response %d", resp.code)
+		}
+		u.inDialog(ref, "NOTIFY", 6, "SIP/2.0 486 Busy Here\r\n", map[string]string{
+			"Event":              "refer",
+			"Subscription-State": "terminated;reason=noresource",
+			"Content-Type":       "message/sipfrag;version=2.0",
+		})
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	call, err := ep.Dial(ctx, u.uri())
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = call.Transfer(ctx, "sip:carol@127.0.0.1:9")
+	if err == nil || !strings.Contains(err.Error(), "486") {
+		t.Fatalf("transfer: %v", err)
+	}
+	select {
+	case <-call.Done():
+		t.Fatal("stale notify ended the call")
+	default:
+	}
+	_ = call.Hangup(context.Background())
+}
+
+func TestReferStaleByeDoesNotEndCall(t *testing.T) {
+	ep := startEP(t, baseConfig())
+	u := newUAS(t)
+	go func() {
+		inv := u.waitMethod("INVITE", 2*time.Second)
+		u.respond(inv, 200, "OK", earlyBodyString(u.rtpPort(), true), nil)
+		_ = u.waitMethod("ACK", 2*time.Second)
+		ref := u.waitMethod("REFER", 2*time.Second)
+		u.respond(ref, 202, "Accepted", "", map[string]string{"Expires": "30"})
+		u.inDialog(ref, "UPDATE", 5, "", nil)
+		if resp := u.waitCode(200, "UPDATE", 2*time.Second); resp.code != 200 {
+			t.Errorf("update response %d", resp.code)
+		}
+		u.inDialog(ref, "BYE", 3, "", nil)
+		if resp := u.waitCode(500, "BYE", 2*time.Second); resp.code != 500 {
+			t.Errorf("stale bye response %d", resp.code)
+		}
+		u.inDialog(ref, "NOTIFY", 6, "SIP/2.0 486 Busy Here\r\n", map[string]string{
+			"Event":              "refer",
+			"Subscription-State": "terminated;reason=noresource",
+			"Content-Type":       "message/sipfrag;version=2.0",
+		})
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	call, err := ep.Dial(ctx, u.uri())
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = call.Transfer(ctx, "sip:carol@127.0.0.1:9")
+	if err == nil || !strings.Contains(err.Error(), "486") {
+		t.Fatalf("transfer: %v", err)
+	}
+	select {
+	case <-call.Done():
+		t.Fatal("stale bye ended the call")
+	default:
+	}
+	_ = call.Hangup(context.Background())
 }
 
 func TestReferExpires(t *testing.T) {

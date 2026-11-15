@@ -539,13 +539,21 @@ func (e *Endpoint) onBye(req *sip.Request, tx sip.ServerTransaction) {
 	}
 	d.mu.Lock()
 	held := d.holdFinish || d.notes != nil
+	base := uint32(0)
+	if d.haveRemote {
+		base = d.remoteCSeq
+	}
 	d.mu.Unlock()
-	// A BYE pipelined with NOTIFY must not move the remote CSeq or close
-	// Done. The NOTIFY is still answered 200 and Transfer reads the sipfrag.
-	if !held {
-		if err := d.noteRemote(req); err != nil {
-			_ = e.respond(tx, req, sip.StatusInternalServerError, phrase(sip.StatusInternalServerError), nil)
-			return
+	if err := d.noteRemote(req); err != nil {
+		_ = e.respond(tx, req, sip.StatusInternalServerError, phrase(sip.StatusInternalServerError), nil)
+		return
+	}
+	if held {
+		if cseq := req.CSeq(); cseq != nil && cseq.SeqNo > base {
+			d.mu.Lock()
+			d.referByeBase = base
+			d.referByeSeq = cseq.SeqNo
+			d.mu.Unlock()
 		}
 	}
 	_ = e.respond(tx, req, sip.StatusOK, phrase(sip.StatusOK), nil)

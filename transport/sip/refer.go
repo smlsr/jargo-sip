@@ -91,6 +91,8 @@ func (c *Call) refer(ctx context.Context, target, replaces string) error {
 	// Hold Done across the subscription. A BYE pipelined with NOTIFY must
 	// not finish the call before the sipfrag is read.
 	d.holdFinish = true
+	d.referByeSeq = 0
+	d.referByeBase = 0
 	d.mu.Unlock()
 	defer func() {
 		d.mu.Lock()
@@ -327,9 +329,8 @@ func (e *Endpoint) onNotify(req *sip.Request, tx sip.ServerTransaction) {
 	_ = e.respond(tx, req, sip.StatusOK, phrase(sip.StatusOK), nil)
 }
 
-// lateReferNotify accepts one refer NOTIFY whose CSeq lost the race to a
-// pipelined BYE. The BYE already moved the remote sequence forward, and
-// dropping this sipfrag would fail a transfer that the peer completed.
+// lateReferNotify accepts one refer NOTIFY that a pipelined BYE jumped
+// over. A NOTIFY already behind some earlier remote CSeq is rejected.
 func (d *dialog) lateReferNotify(req *sip.Request) bool {
 	cseq := req.CSeq()
 	if cseq == nil || cseq.MethodName != sip.NOTIFY {
@@ -341,16 +342,20 @@ func (d *dialog) lateReferNotify(req *sip.Request) bool {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.notes == nil || !d.holdFinish {
+	if d.notes == nil || !d.holdFinish || d.referByeSeq == 0 {
 		return false
 	}
-	if _, seen := d.seenRemote[cseq.SeqNo]; seen {
+	seq := cseq.SeqNo
+	if seq <= d.referByeBase || seq >= d.referByeSeq {
+		return false
+	}
+	if _, seen := d.seenRemote[seq]; seen {
 		return false
 	}
 	if d.seenRemote == nil {
 		d.seenRemote = map[uint32]struct{}{}
 	}
-	d.seenRemote[cseq.SeqNo] = struct{}{}
+	d.seenRemote[seq] = struct{}{}
 	return true
 }
 

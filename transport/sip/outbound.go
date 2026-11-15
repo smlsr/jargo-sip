@@ -209,15 +209,17 @@ func (d *dialog) waitInvite(ctx context.Context, tx sip.ClientTransaction, invit
 		d.learnResponse(res, invite)
 		if res.IsProvisional() {
 			saw1xx = true
+			var earlyErr error
 			if res.StatusCode == sip.StatusSessionInProgress {
-				if err := d.playEarly(res, offered); err != nil {
-					return d.failBeforeAnswer(invite, err)
-				}
+				earlyErr = d.playEarly(res, offered)
 			}
-			if progress != nil && res.StatusCode > sip.StatusTrying {
+			if progress != nil && earlyErr == nil && res.StatusCode > sip.StatusTrying {
 				progress(res.StatusCode, reasonText(res))
 			}
 			_ = d.prack(ctx, res, invite)
+			if earlyErr != nil {
+				return d.failBeforeAnswer(invite, earlyErr)
+			}
 			continue
 		}
 		if res.StatusCode == sip.StatusUnauthorized || res.StatusCode == sip.StatusProxyAuthRequired {
