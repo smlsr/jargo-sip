@@ -62,8 +62,10 @@ type DTMFConfig struct {
 }
 
 // LatchConfig selects how a source is matched. Empty uses the NAT mode default.
+// AllowRTPFrom lists extra source IPs accepted when Match is port.
 type LatchConfig struct {
-	Match string
+	Match        string
+	AllowRTPFrom []string
 }
 
 // RTCPConfig is the report interval. Zero becomes 5s.

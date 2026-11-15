@@ -20,6 +20,10 @@ var (
 	ErrRTPRange = errors.New("RTP port range is odd or inverted")
 	// ErrAllowFromEmpty is returned when AllowFrom has no entry.
 	ErrAllowFromEmpty = errors.New("AllowFrom is empty")
+	// ErrLatchMatch is returned when Latch.Match is not port, address, or off.
+	ErrLatchMatch = errors.New("Latch.Match is unknown")
+	// ErrAllowRTPFrom is returned when an AllowRTPFrom entry is not an IPv4 address.
+	ErrAllowRTPFrom = errors.New("AllowRTPFrom is not an IPv4 address")
 )
 
 type prepared struct {
@@ -90,6 +94,22 @@ func prepare(cfg Config) (prepared, error) {
 		return prepared{}, err
 	}
 
+	switch cfg.Latch.Match {
+	case LatchMatchPort, LatchMatchAddress, LatchMatchOff:
+	default:
+		return prepared{}, fmt.Errorf("%w: %q", ErrLatchMatch, cfg.Latch.Match)
+	}
+	allowRTP, err := parseAllowRTP(cfg.Latch.AllowRTPFrom)
+	if err != nil {
+		return prepared{}, err
+	}
+	if len(allowRTP) > 0 {
+		cfg.Latch.AllowRTPFrom = make([]string, len(allowRTP))
+		for i, ip := range allowRTP {
+			cfg.Latch.AllowRTPFrom[i] = ip.String()
+		}
+	}
+
 	if cfg.NATMode == NATBehindSBC {
 		if cfg.PortMap == PortMapSTUN || cfg.STUNServer != "" {
 			return prepared{}, ErrSTUNBehindSBC
@@ -118,6 +138,22 @@ func prepare(cfg Config) (prepared, error) {
 		udp:       udp,
 		tcp:       tcp,
 	}, nil
+}
+
+func parseAllowRTP(list []string) ([]net.IP, error) {
+	var out []net.IP
+	for _, raw := range list {
+		s := strings.TrimSpace(raw)
+		if s == "" {
+			continue
+		}
+		ip := net.ParseIP(s)
+		if ip == nil || ip.To4() == nil {
+			return nil, fmt.Errorf("%w: %q", ErrAllowRTPFrom, raw)
+		}
+		out = append(out, cloneIP(ip))
+	}
+	return out, nil
 }
 
 func checkRTP(min, max int) error {

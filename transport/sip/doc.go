@@ -12,6 +12,14 @@
 // telephone-event/8000. a=rtcp is written only when the RTP and RTCP ports
 // are not consecutive. The allocator returns the lowest free even port in
 // [RTPPortMin, RTPPortMax] and reserves the next port for RTCP.
+// There is no a=rtcp-mux.
 //
-// Dialogs and the media sender are not part of this package yet.
+// StartMedia runs one RTP session on an allocated pair. The sender uses
+// github.com/pion/rtp v1.10.6 and a 20 ms clock at 8000 Hz. RTCP uses
+// github.com/pion/rtcp v1.2.20 on the paired socket and its own latch.
+// PCMU and PCMA bytes come from github.com/gojargo/jargo/audio/g711 v0.6.1
+// (2026-11-12, 7d0492d2c0febfaa0c140007317992f84c8c1be9). Codec silence on
+// the wire is µ-law 0xFF or A-law 0xD5.
+//
+// Dialogs, the jitter buffer, and DTMF are not part of this package yet.
 package sip
