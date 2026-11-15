@@ -70,6 +70,7 @@ type dtmfRecv struct {
 	cur    *dtmfPress
 	done   map[dtmfKey]struct{}
 	queue  []DTMF
+	keys   []DTMF
 	closed bool
 }
 
@@ -187,13 +188,21 @@ func (d *dtmfRecv) emit(p *dtmfPress) {
 		d.done = map[dtmfKey]struct{}{}
 	}
 	d.done[p.key] = struct{}{}
+	ev := DTMF{
+		Event:    p.key.event,
+		Duration: time.Duration(p.dur) * time.Second / wireClock,
+	}
 	if len(d.queue) == maxDTMFQueue {
 		d.queue = d.queue[1:]
 	}
-	d.queue = append(d.queue, DTMF{
-		Event:    p.key.event,
-		Duration: time.Duration(p.dur) * time.Second / wireClock,
-	})
+	d.queue = append(d.queue, ev)
+	// 0-11 are also keypad frames. 12-15 and flash stay on ReadDTMF only.
+	if ev.Event <= 11 {
+		if len(d.keys) == maxDTMFQueue {
+			d.keys = d.keys[1:]
+		}
+		d.keys = append(d.keys, ev)
+	}
 	d.cond.Broadcast()
 }
 
