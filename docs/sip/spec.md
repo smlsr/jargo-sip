@@ -27,6 +27,13 @@ PortMap: `identity` uses the local bind port. `stun` uses that socket's mapped p
 ```go
 type NATMode string // "behind-sbc" | "standalone"
 
+type TLSConfig struct {
+    CertFile           string // with KeyFile, the listener certificate
+    KeyFile            string
+    SelfSigned         bool // generate when CertFile and KeyFile are empty
+    IgnoreCertWarnings bool // outbound TLS accepts a peer certificate that fails verification
+}
+
 type Config struct {
     NATMode      NATMode
     ListenIP     string
@@ -37,7 +44,8 @@ type Config struct {
     User         string
     DisplayName  string
     SIPPort      int // default 5060
-    Transports   []string // udp, tcp; tls needs a certificate
+    Transports   []string // udp, tcp, tls. Empty means udp
+    TLS          *TLSConfig // required when tls is listed
     RTPPortMin   int // default 10000
     RTPPortMax   int // default 20000, even span
     Auth         *DigestAuth
@@ -56,7 +64,7 @@ type Config struct {
 
 Jitter defaults: Target 40ms, Min 20ms, Max 200ms. DTMF: PayloadType 0 means 101; DigitDuration default 160ms; InterDigitGap default 100ms. Inbound offer payload type wins.
 
-Start refuses: behind-sbc combined with STUN or a public AdvertiseIP, empty Domain, RTP range odd or inverted, AllowFrom empty.
+Start refuses: behind-sbc combined with STUN or a public AdvertiseIP, empty Domain, RTP range odd or inverted, AllowFrom empty. `tls` in Transports listens on the SIP port. `TLS.CertFile` and `TLS.KeyFile`, when both are set, are the listener certificate and key. When `SelfSigned` is set and no certificate files are given, Start generates a self-signed certificate for the advertised address and uses it on the TLS listener. `IgnoreCertWarnings`, when set, makes outbound TLS accept a peer certificate that fails verification, including a self-signed peer. When it is unset, verification stays on. Empty Transports stays UDP. `tcp` is unchanged. UDP and TLS can both be enabled.
 
 API:
 

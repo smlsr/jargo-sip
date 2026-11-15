@@ -2,6 +2,7 @@ package sip
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -35,8 +36,12 @@ type Endpoint struct {
 	closed     bool
 	sipUDP     *net.UDPConn
 	sipTCP     *net.TCPListener
+	sipTLS     net.Listener
+	sipTLSRaw  *net.TCPListener
 	pending    []*net.UDPConn
 	pendingTCP *net.TCPListener
+	pendingTLS *net.TCPListener
+	tlsClient  *tls.Config
 	addrs      Addresses
 	stun       *net.UDPAddr
 	bindIP     net.IP
@@ -115,12 +120,18 @@ func (e *Endpoint) Start(ctx context.Context) error {
 
 	var udp *net.UDPConn
 	var tcp *net.TCPListener
+	var tlsRaw *net.TCPListener
+	var tlsLn net.Listener
 	owned := false
 	defer func() {
 		if owned {
 			return
 		}
-		closeBind(udp, tcp)
+		ln := tlsLn
+		if ln == nil {
+			ln = tlsRaw
+		}
+		closeBind(udp, tcp, ln)
 		e.mu.Lock()
 		e.starting = false
 		e.mu.Unlock()
@@ -130,15 +141,15 @@ func (e *Endpoint) Start(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	udp, tcp, port, err := listenSIP(ready)
+	udp, tcp, tlsRaw, port, err := listenSIP(ready)
 	if err != nil {
 		return err
 	}
-	if err := e.holdBind(udp, tcp); err != nil {
+	if err := e.holdBind(udp, tcp, tlsRaw); err != nil {
 		return err
 	}
-	defer e.releaseBind(udp, tcp)
-	localIP, err := advertiseLocal(socketIP(udp, tcp))
+	defer e.releaseBind(udp, tcp, tlsRaw)
+	localIP, err := advertiseLocal(socketIP(udp, tcp, tlsRaw))
 	if err != nil {
 		return err
 	}
@@ -174,6 +185,13 @@ func (e *Endpoint) Start(ctx context.Context) error {
 			}
 		}
 	}
+	if ready.tls {
+		scfg, serr := serverTLSConfig(ready.cfg, advIP.String())
+		if serr != nil {
+			return serr
+		}
+		tlsLn = tls.NewListener(tlsRaw, scfg)
+	}
 
 	e.mu.Lock()
 	if e.closed {
@@ -185,6 +203,8 @@ func (e *Endpoint) Start(ctx context.Context) error {
 	e.stun = stunAddr
 	e.sipUDP = udp
 	e.sipTCP = tcp
+	e.sipTLS = tlsLn
+	e.sipTLSRaw = tlsRaw
 	e.rtpMin = ready.cfg.RTPPortMin
 	e.rtpMax = ready.cfg.RTPPortMax
 	e.used = map[int]struct{}{}
@@ -202,7 +222,7 @@ func (e *Endpoint) Start(ctx context.Context) error {
 	root, cancel := context.WithCancel(context.Background())
 	e.root = root
 	e.rootCancel = cancel
-	if err := e.openSIP(advIP, advPort, udp, tcp); err != nil {
+	if err := e.openSIP(advIP, advPort, udp, tcp, tlsLn); err != nil {
 		cancel()
 		e.root = nil
 		e.rootCancel = nil
@@ -272,19 +292,22 @@ func (e *Endpoint) abortStart() {
 	ua := e.sipUA
 	udp := e.sipUDP
 	tcp := e.sipTCP
+	tlsLn := e.sipTLS
 	e.sipUA = nil
 	e.sipCli = nil
 	e.root = nil
 	e.rootCancel = nil
 	e.sipUDP = nil
 	e.sipTCP = nil
+	e.sipTLS = nil
+	e.sipTLSRaw = nil
 	e.started = false
 	e.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
 	// Close the socket before the user agent so ServeUDP can return.
-	_ = closeBind(udp, tcp)
+	_ = closeBind(udp, tcp, tlsLn)
 	if ua != nil {
 		_ = ua.Close()
 	}
@@ -315,9 +338,12 @@ func (e *Endpoint) shutdown() error {
 	defer e.mu.Unlock()
 	ownedUDP := e.sipUDP
 	ownedTCP := e.sipTCP
-	err := closeBind(e.sipUDP, e.sipTCP)
+	ownedTLS := e.sipTLSRaw
+	err := closeBind(e.sipUDP, e.sipTCP, e.sipTLS)
 	e.sipUDP = nil
 	e.sipTCP = nil
+	e.sipTLS = nil
+	e.sipTLSRaw = nil
 	closedUDP := map[*net.UDPConn]bool{}
 	if ownedUDP != nil {
 		closedUDP[ownedUDP] = true
@@ -340,6 +366,12 @@ func (e *Endpoint) shutdown() error {
 		}
 	}
 	e.pendingTCP = nil
+	if e.pendingTLS != nil && e.pendingTLS != ownedTLS {
+		if cerr := e.pendingTLS.Close(); err == nil {
+			err = cerr
+		}
+	}
+	e.pendingTLS = nil
 	for _, c := range e.pending {
 		if c == nil || closedUDP[c] {
 			continue
@@ -354,7 +386,7 @@ func (e *Endpoint) shutdown() error {
 }
 
 // holdBind publishes sockets Close must drop while Start is still inside STUN.
-func (e *Endpoint) holdBind(udp *net.UDPConn, tcp *net.TCPListener) error {
+func (e *Endpoint) holdBind(udp *net.UDPConn, tcp *net.TCPListener, tlsRaw *net.TCPListener) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.closed {
@@ -364,10 +396,11 @@ func (e *Endpoint) holdBind(udp *net.UDPConn, tcp *net.TCPListener) error {
 		e.pending = append(e.pending, udp)
 	}
 	e.pendingTCP = tcp
+	e.pendingTLS = tlsRaw
 	return nil
 }
 
-func (e *Endpoint) releaseBind(udp *net.UDPConn, tcp *net.TCPListener) {
+func (e *Endpoint) releaseBind(udp *net.UDPConn, tcp *net.TCPListener, tlsRaw *net.TCPListener) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if udp != nil {
@@ -375,6 +408,9 @@ func (e *Endpoint) releaseBind(udp *net.UDPConn, tcp *net.TCPListener) {
 	}
 	if tcp != nil && e.pendingTCP == tcp {
 		e.pendingTCP = nil
+	}
+	if tlsRaw != nil && e.pendingTLS == tlsRaw {
+		e.pendingTLS = nil
 	}
 }
 
@@ -411,21 +447,22 @@ func (e *Endpoint) removePendingLocked(c *net.UDPConn) {
 	e.pending = e.pending[:n]
 }
 
-func listenSIP(p prepared) (*net.UDPConn, *net.TCPListener, int, error) {
+func listenSIP(p prepared) (*net.UDPConn, *net.TCPListener, *net.TCPListener, int, error) {
 	port := p.cfg.SIPPort
 	var udp *net.UDPConn
 	var tcp *net.TCPListener
+	var tlsRaw *net.TCPListener
 	if p.udp {
 		addr := &net.UDPAddr{IP: p.bindIP, Port: port}
 		var err error
 		udp, err = net.ListenUDP("udp", addr)
 		if err != nil {
-			return nil, nil, 0, fmt.Errorf("listen udp %s: %w", addr, err)
+			return nil, nil, nil, 0, fmt.Errorf("listen udp %s: %w", addr, err)
 		}
 		got, ok := udp.LocalAddr().(*net.UDPAddr)
 		if !ok {
 			udp.Close()
-			return nil, nil, 0, errors.New("udp listen address is missing")
+			return nil, nil, nil, 0, errors.New("udp listen address is missing")
 		}
 		port = got.Port
 	}
@@ -434,22 +471,39 @@ func listenSIP(p prepared) (*net.UDPConn, *net.TCPListener, int, error) {
 		var err error
 		tcp, err = net.ListenTCP("tcp", addr)
 		if err != nil {
-			closeBind(udp, nil)
-			return nil, nil, 0, fmt.Errorf("listen tcp %s: %w", addr, err)
+			closeBind(udp, nil, nil)
+			return nil, nil, nil, 0, fmt.Errorf("listen tcp %s: %w", addr, err)
 		}
 		if !p.udp {
 			got, ok := tcp.Addr().(*net.TCPAddr)
 			if !ok {
 				tcp.Close()
-				return nil, nil, 0, errors.New("tcp listen address is missing")
+				return nil, nil, nil, 0, errors.New("tcp listen address is missing")
 			}
 			port = got.Port
 		}
 	}
-	return udp, tcp, port, nil
+	if p.tls {
+		addr := &net.TCPAddr{IP: p.bindIP, Port: port}
+		var err error
+		tlsRaw, err = net.ListenTCP("tcp", addr)
+		if err != nil {
+			closeBind(udp, tcp, nil)
+			return nil, nil, nil, 0, fmt.Errorf("listen tls %s: %w", addr, err)
+		}
+		if !p.udp && !p.tcp {
+			got, ok := tlsRaw.Addr().(*net.TCPAddr)
+			if !ok {
+				tlsRaw.Close()
+				return nil, nil, nil, 0, errors.New("tls listen address is missing")
+			}
+			port = got.Port
+		}
+	}
+	return udp, tcp, tlsRaw, port, nil
 }
 
-func socketIP(udp *net.UDPConn, tcp *net.TCPListener) net.IP {
+func socketIP(udp *net.UDPConn, tcp *net.TCPListener, tlsRaw *net.TCPListener) net.IP {
 	if udp != nil {
 		if a, ok := udp.LocalAddr().(*net.UDPAddr); ok {
 			return a.IP
@@ -460,16 +514,26 @@ func socketIP(udp *net.UDPConn, tcp *net.TCPListener) net.IP {
 			return a.IP
 		}
 	}
+	if tlsRaw != nil {
+		if a, ok := tlsRaw.Addr().(*net.TCPAddr); ok {
+			return a.IP
+		}
+	}
 	return nil
 }
 
-func closeBind(udp *net.UDPConn, tcp *net.TCPListener) error {
+func closeBind(udp *net.UDPConn, tcp *net.TCPListener, tlsLn net.Listener) error {
 	var err error
 	if udp != nil {
 		err = udp.Close()
 	}
 	if tcp != nil {
 		if cerr := tcp.Close(); err == nil {
+			err = cerr
+		}
+	}
+	if tlsLn != nil {
+		if cerr := tlsLn.Close(); err == nil {
 			err = cerr
 		}
 	}

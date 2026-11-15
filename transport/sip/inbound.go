@@ -15,11 +15,19 @@ import (
 	"github.com/emiago/sipgo/sip"
 )
 
-func (e *Endpoint) openSIP(advIP net.IP, advPort int, udp *net.UDPConn, tcp *net.TCPListener) error {
-	if udp == nil {
+func (e *Endpoint) openSIP(advIP net.IP, advPort int, udp *net.UDPConn, tcp *net.TCPListener, tlsLn net.Listener) error {
+	if udp == nil && tlsLn == nil {
 		return nil
 	}
-	host, port, err := sip.ParseAddr(udp.LocalAddr().String())
+	local := net.Addr(nil)
+	transportName := "udp"
+	if udp != nil {
+		local = udp.LocalAddr()
+	} else {
+		local = tlsLn.Addr()
+		transportName = "tls"
+	}
+	host, port, err := sip.ParseAddr(local.String())
 	if err != nil {
 		return err
 	}
@@ -29,7 +37,7 @@ func (e *Endpoint) openSIP(advIP net.IP, advPort int, udp *net.UDPConn, tcp *net
 	}
 	e.listen = sip.Addr{IP: append(net.IP(nil), ip...), Port: port, Hostname: ip.String()}
 	params := sip.NewParams()
-	params.Add("transport", "udp")
+	params.Add("transport", transportName)
 	e.contact = sip.ContactHeader{
 		Address: sip.Uri{
 			Scheme:    "sip",
@@ -39,18 +47,23 @@ func (e *Endpoint) openSIP(advIP net.IP, advPort int, udp *net.UDPConn, tcp *net
 			UriParams: params,
 		},
 	}
+	e.tlsClient = clientTLSConfig(e.cfg.TLS)
 	ua, err := sipgo.NewUA(
 		sipgo.WithUserAgent("jargo-sip"),
 		sipgo.WithUserAgentHostname(advIP.String()),
+		sipgo.WithUserAgenTLSConfig(e.tlsClient),
 	)
 	if err != nil {
 		return err
 	}
-	cli, err := sipgo.NewClient(ua,
+	clientOpts := []sipgo.ClientOption{
 		sipgo.WithClientHostname(advIP.String()),
 		sipgo.WithClientPort(advPort),
-		sipgo.WithClientConnectionAddr(e.listen.String()),
-	)
+	}
+	if udp != nil {
+		clientOpts = append(clientOpts, sipgo.WithClientConnectionAddr(e.listen.String()))
+	}
+	cli, err := sipgo.NewClient(ua, clientOpts...)
 	if err != nil {
 		_ = ua.Close()
 		return err
@@ -71,16 +84,25 @@ func (e *Endpoint) openSIP(advIP net.IP, advPort int, udp *net.UDPConn, tcp *net
 	srv.OnRefer(e.onRefer)
 	srv.OnNotify(e.onNotify)
 	srv.OnOptions(e.onOptions)
-	e.serveWG.Add(1)
-	go func() {
-		defer e.serveWG.Done()
-		_ = srv.ServeUDP(udp)
-	}()
+	if udp != nil {
+		e.serveWG.Add(1)
+		go func() {
+			defer e.serveWG.Done()
+			_ = srv.ServeUDP(udp)
+		}()
+	}
 	if tcp != nil {
 		e.serveWG.Add(1)
 		go func() {
 			defer e.serveWG.Done()
 			_ = srv.ServeTCP(tcp)
+		}()
+	}
+	if tlsLn != nil {
+		e.serveWG.Add(1)
+		go func() {
+			defer e.serveWG.Done()
+			_ = srv.ServeTLS(tlsLn)
 		}()
 	}
 	return nil

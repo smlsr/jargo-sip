@@ -54,6 +54,15 @@ type RTCPConfig struct {
     Interval time.Duration // zero means 5s. See rtcp.md.
 }
 
+// TLSConfig is the SIP TLS listener certificate and the outbound verification policy.
+// Required when Transports contains tls.
+type TLSConfig struct {
+    CertFile           string // with KeyFile, used as given
+    KeyFile            string
+    SelfSigned         bool // generate when CertFile and KeyFile are empty
+    IgnoreCertWarnings bool // outbound TLS accepts a peer certificate that fails verification
+}
+
 type Config struct {
     NATMode      NATMode
     ListenIP     string // empty binds 0.0.0.0. IPv4 only.
@@ -65,6 +74,7 @@ type Config struct {
     DisplayName  string
     SIPPort      int      // zero means 5060
     Transports   []string // empty means udp. See below.
+    TLS          *TLSConfig
     RTPPortMin   int      // zero means 10000 when RTPPortMax is also zero
     RTPPortMax   int      // zero means 20000 when RTPPortMin is also zero
     Auth         *DigestAuth
@@ -81,7 +91,9 @@ type Config struct {
 }
 ```
 
-`Transports`: this build's SIP socket is UDP, which is also the socket STUN runs on. An empty list means UDP. `udp` is accepted. `tcp` and `tls` make `Start` return an error. TLS needs a certificate, and `Config` has no certificate. RTP is UDP in every mode.
+`Transports`: an empty list means UDP. `udp` and `tcp` listen on `SIPPort`. `tls` listens on `SIPPort` when `TLS` supplies a certificate. UDP and TLS can both be enabled. RTP stays UDP. STUN still runs on the SIP UDP socket.
+
+`TLS` is required when `tls` is listed. `CertFile` and `KeyFile`, when both are set, are the listener certificate and private key, including when `SelfSigned` is also set. When `SelfSigned` is set and those files are empty, `Start` generates a self-signed certificate for the advertised address and uses it on the TLS listener. `IgnoreCertWarnings`, when set, makes outbound TLS accept a peer certificate that fails verification, including a self-signed peer. When it is unset, verification stays on. A TLS-only listener puts `transport=tls` on Contact. When UDP is enabled, Contact stays `transport=udp`.
 
 `AllowFrom` entries are IP addresses or CIDR prefixes. The match is the source address of the SIP packet, not the Via host. A name is a `Start` error.
 
@@ -124,7 +136,7 @@ Allow: INVITE, ACK, CANCEL, BYE, UPDATE, PRACK, REFER, NOTIFY, OPTIONS
 - `AllowFrom` empty, or an entry that is not an IP or CIDR.
 - The RTP range is odd or inverted after defaults are applied. Both ends must be even and `RTPPortMin` must be less than or equal to `RTPPortMax`. A range with no even port is refused. See [ports.md](ports.md).
 - `ListenIP` is not empty and not an IPv4 address.
-- `Transports` contains anything other than `udp`.
+- `Transports` names an unknown transport, or names `tls` without a certificate. A certificate is `CertFile` and `KeyFile` together, or `SelfSigned` with neither file. One file without the other is refused.
 - `Codecs` contains anything other than `PCMU` or `PCMA`.
 - `Latch.Match` is set and is not `port`, `address`, or `off`.
 - `PortMap` is set and is not `identity` or `stun`.

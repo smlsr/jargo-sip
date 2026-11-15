@@ -35,6 +35,7 @@ type prepared struct {
 	stun      string
 	udp       bool
 	tcp       bool
+	tls       bool
 }
 
 func prepare(cfg Config) (prepared, error) {
@@ -75,11 +76,14 @@ func prepare(cfg Config) (prepared, error) {
 		return prepared{}, fmt.Errorf("SIP port %d is out of range", cfg.SIPPort)
 	}
 
-	udp, tcp, transports, err := normalizeTransports(cfg.Transports)
+	udp, tcp, tlsOn, transports, err := normalizeTransports(cfg.Transports)
 	if err != nil {
 		return prepared{}, err
 	}
 	cfg.Transports = transports
+	if err := checkTLS(&cfg, tlsOn); err != nil {
+		return prepared{}, err
+	}
 
 	switch cfg.PortMap {
 	case PortMapIdentity, PortMapSTUN:
@@ -143,7 +147,32 @@ func prepare(cfg Config) (prepared, error) {
 		stun:      cfg.STUNServer,
 		udp:       udp,
 		tcp:       tcp,
+		tls:       tlsOn,
 	}, nil
+}
+
+func checkTLS(cfg *Config, on bool) error {
+	if cfg.TLS != nil {
+		cp := *cfg.TLS
+		cp.CertFile = strings.TrimSpace(cp.CertFile)
+		cp.KeyFile = strings.TrimSpace(cp.KeyFile)
+		cfg.TLS = &cp
+	}
+	if !on {
+		return nil
+	}
+	if cfg.TLS == nil {
+		return errors.New("tls needs a certificate")
+	}
+	hasCert := cfg.TLS.CertFile != ""
+	hasKey := cfg.TLS.KeyFile != ""
+	if hasCert != hasKey {
+		return errors.New("tls certificate and key must both be set")
+	}
+	if !hasCert && !cfg.TLS.SelfSigned {
+		return errors.New("tls needs a certificate")
+	}
+	return nil
 }
 
 func parseAllowRTP(list []string) ([]net.IP, error) {
@@ -174,7 +203,7 @@ func checkRTP(min, max int) error {
 	return nil
 }
 
-func normalizeTransports(in []string) (udp, tcp bool, out []string, err error) {
+func normalizeTransports(in []string) (udp, tcp, tlsOn bool, out []string, err error) {
 	if len(in) == 0 {
 		in = []string{"udp"}
 	}
@@ -187,17 +216,17 @@ func normalizeTransports(in []string) (udp, tcp bool, out []string, err error) {
 		case "tcp":
 			tcp = true
 		case "tls":
-			return false, false, nil, errors.New("tls needs a certificate")
+			tlsOn = true
 		default:
-			return false, false, nil, fmt.Errorf("transport %q is unknown", raw)
+			return false, false, false, nil, fmt.Errorf("transport %q is unknown", raw)
 		}
 		if !seen[name] {
 			seen[name] = true
 			out = append(out, name)
 		}
 	}
-	if !udp && !tcp {
-		return false, false, nil, errors.New("no SIP transport is configured")
+	if !udp && !tcp && !tlsOn {
+		return false, false, false, nil, errors.New("no SIP transport is configured")
 	}
-	return udp, tcp, out, nil
+	return udp, tcp, tlsOn, out, nil
 }
