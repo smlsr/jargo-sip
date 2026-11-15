@@ -364,6 +364,10 @@ func (d Description) Marshal() ([]byte, error) {
 // telephone-event/8000 are kept. Other payload types are ignored.
 // A missing a=rtcp means RTCP is the RTP port plus 1.
 func Parse(raw string) (Description, error) {
+	// pion's parser returns EOF when the description does not end in a newline.
+	if raw != "" && !strings.HasSuffix(raw, "\n") {
+		raw += "\n"
+	}
 	var sd psdp.SessionDescription
 	if err := sd.UnmarshalString(raw); err != nil {
 		return Description{}, err

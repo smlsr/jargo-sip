@@ -27,11 +27,16 @@
 // 8000 build one audio/resample stream per direction; 8000 does not.
 // Stopped playout returns concealment instead of that caller audio.
 //
+// Telephone-event follows RFC 4733. ReadDTMF emits one event per press.
+// WriteDTMF replaces audio for that press, then sends three end packets.
+// A 183 with SDP starts early media into ReadPCM. A 200 that repeats the
+// address keeps that sender and the frames already queued. The basic UAS
+// path does not generate a 183.
+//
 // Inbound dialogs live on Endpoint. github.com/emiago/sipgo v1.7.3
 // (2026-11-10, c6c20f2df8a7) owns transactions and the dialog session.
 // Digest challenges use github.com/icholy/digest v1.2.0 (2026-07-28).
 // Accept takes one established call. The first INVITE starts media when
 // the ACK arrives. re-INVITE and UPDATE commit a media change when the
-// 200 is sent. 100rel state stays on the dialog. DTMF is not part of
-// this package yet.
+// 200 is sent. 100rel state stays on the dialog. Supported is 100rel.
 package sip
