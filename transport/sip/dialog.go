@@ -233,6 +233,10 @@ type dialog struct {
 	sessionGen       uint64
 	sessionRefresh   *time.Timer
 	sessionExpiry    *time.Timer
+
+	headers    headerState
+	headerOnce sync.Once
+	headerID   uint64
 }
 
 func newDialog(ep *Endpoint, sess *sipgo.DialogServerSession) (*dialog, error) {
@@ -644,6 +648,7 @@ func (d *dialog) craft(method sip.RequestMethod, body []byte, ctype string, extr
 	}
 	req.SetDestination(dest)
 	req.Laddr = d.ep.listen
+	d.stamp(req, nil)
 	return req, nil
 }
 
@@ -662,6 +667,7 @@ func (d *dialog) roundTrip(ctx context.Context, req *sip.Request) (*sip.Response
 			if res.IsProvisional() {
 				continue
 			}
+			d.noteArrived(res)
 			return res, nil
 		case <-tx.Done():
 			if err := tx.Err(); err != nil {
@@ -710,6 +716,7 @@ func (d *dialog) ackInvite(invite *sip.Request, res *sip.Response) error {
 	}
 	ack.SetDestination(dest)
 	ack.Laddr = d.ep.listen
+	d.stamp(ack, nil)
 	return d.ep.writeReq(ack)
 }
 

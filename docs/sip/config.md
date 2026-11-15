@@ -138,7 +138,7 @@ Allow: INVITE, ACK, CANCEL, BYE, UPDATE, PRACK, REFER, NOTIFY, OPTIONS
 func New(cfg Config) (*Endpoint, error)
 func (e *Endpoint) Start(ctx context.Context) error
 func (e *Endpoint) Accept() (*Call, error)
-func (e *Endpoint) Dial(ctx context.Context, uri string) (*Call, error)
+func (e *Endpoint) Dial(ctx context.Context, uri string, headers ...Header) (*Call, error)
 func (e *Endpoint) OnReplaced(func(old, new *Call))
 func (e *Endpoint) Close() error
 
@@ -148,8 +148,12 @@ func (c *Call) ReadDTMF() (DTMF, error)
 func (c *Call) WriteDTMF(ev DTMF) error
 func (c *Call) Hold(ctx context.Context) error
 func (c *Call) Resume(ctx context.Context) error
-func (c *Call) Transfer(ctx context.Context, target string) error
-func (c *Call) TransferAttended(ctx context.Context, other *Call) error
+func (c *Call) Transfer(ctx context.Context, target string, headers ...Header) error
+func (c *Call) TransferAttended(ctx context.Context, other *Call, headers ...Header) error
+func (c *Call) SetHeader(name, value string)
+func (c *Call) Header(name string) (string, bool)
+func (e *Endpoint) SetHeader(name, value string)
+func (e *Endpoint) Header(name string) (string, bool)
 func (c *Call) Hangup(ctx context.Context) error
 func (c *Call) Remote() Party
 func (c *Call) Done() <-chan struct{}
@@ -174,6 +178,8 @@ type DTMF struct {
 `WritePCM` queues 8000 Hz PCM. The RTP sender pulls 20 ms at a time. A short buffer waits. After `Done` is closed, `WritePCM` returns an error.
 
 `Hangup` sends BYE on an established dialog and CANCEL on an outbound dialog that has not reached 200. `Done` closes after BYE completes, CANCEL completes, the peer's BYE, `MaxCall`, session-timer expiry, or `Endpoint.Close`.
+
+`Header` values on `Dial`, `Transfer`, and `TransferAttended`, and `SetHeader` / `Header`, are specified in [custom-headers.md](custom-headers.md).
 
 `Remote` returns the peer as currently stored, including the remote target used by attended transfer.
 

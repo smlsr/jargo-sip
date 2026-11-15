@@ -46,10 +46,15 @@ func (e *Endpoint) respond(tx sip.ServerTransaction, req *sip.Request, code int,
 			res.AppendHeader(h)
 		}
 	}
+	if d := e.findDialog(req); d != nil {
+		d.stamp(res, nil)
+	} else {
+		e.stamp(res)
+	}
 	return tx.Respond(res)
 }
 
-func (e *Endpoint) sessionRespond(sess sipgoDialog, code int, reason string, body []byte, extra ...sip.Header) error {
+func (e *Endpoint) sessionRespond(d *dialog, sess sipgoDialog, code int, reason string, body []byte, extra ...sip.Header) error {
 	hs := []sip.Header{e.allowHeader(), e.supportedHeader()}
 	if len(body) > 0 {
 		ct := sip.ContentTypeHeader("application/sdp")
@@ -59,6 +64,11 @@ func (e *Endpoint) sessionRespond(sess sipgoDialog, code int, reason string, bod
 		if h != nil {
 			hs = append(hs, h)
 		}
+	}
+	if d != nil {
+		hs = append(hs, d.customFields()...)
+	} else {
+		hs = append(hs, e.customFields()...)
 	}
 	return sess.Respond(code, reason, body, hs...)
 }

@@ -205,6 +205,7 @@ func (e *Endpoint) onNewInvite(req *sip.Request, tx sip.ServerTransaction) {
 	tx.OnCancel(func(*sip.Request) { cancelled.Store(true) })
 	d.tx = tx
 	d.noteInitial(req)
+	d.noteArrived(req)
 	e.dialogs.put(d)
 	var own bool
 	var gen uint64
@@ -234,7 +235,7 @@ func (e *Endpoint) onNewInvite(req *sip.Request, tx sip.ServerTransaction) {
 		return
 	}
 	own = true
-	if err := e.sessionRespond(sess, sip.StatusTrying, phrase(sip.StatusTrying), nil); err != nil {
+	if err := e.sessionRespond(d, sess, sip.StatusTrying, phrase(sip.StatusTrying), nil); err != nil {
 		return
 	}
 	if cancelled.Load() || d.ended {
@@ -243,7 +244,7 @@ func (e *Endpoint) onNewInvite(req *sip.Request, tx sip.ServerTransaction) {
 	if e.cfg.RequireAuth {
 		ok, code, hdr, aerr := e.checkAuth(callIDOf(req), req)
 		if aerr != nil {
-			_ = e.sessionRespond(sess, sip.StatusInternalServerError, phrase(sip.StatusInternalServerError), nil)
+			_ = e.sessionRespond(d, sess, sip.StatusInternalServerError, phrase(sip.StatusInternalServerError), nil)
 			return
 		}
 		if !ok {
@@ -251,7 +252,7 @@ func (e *Endpoint) onNewInvite(req *sip.Request, tx sip.ServerTransaction) {
 			if hdr != nil {
 				extra = append(extra, hdr)
 			}
-			_ = e.sessionRespond(sess, code, phrase(code), nil, extra...)
+			_ = e.sessionRespond(d, sess, code, phrase(code), nil, extra...)
 			return
 		}
 	}
@@ -260,20 +261,20 @@ func (e *Endpoint) onNewInvite(req *sip.Request, tx sip.ServerTransaction) {
 	}
 	desc, has, err := parseSDP(req)
 	if err != nil || !has {
-		_ = e.sessionRespond(sess, sip.StatusBadRequest, phrase(sip.StatusBadRequest), nil)
+		_ = e.sessionRespond(d, sess, sip.StatusBadRequest, phrase(sip.StatusBadRequest), nil)
 		return
 	}
 	if _, err := chooseAudio(desc, e.cfg); err != nil {
-		_ = e.sessionRespond(sess, sip.StatusNotAcceptableHere, phrase(sip.StatusNotAcceptableHere), nil)
+		_ = e.sessionRespond(d, sess, sip.StatusNotAcceptableHere, phrase(sip.StatusNotAcceptableHere), nil)
 		return
 	}
 	if e.root == nil {
-		_ = e.sessionRespond(sess, sip.StatusInternalServerError, phrase(sip.StatusInternalServerError), nil)
+		_ = e.sessionRespond(d, sess, sip.StatusInternalServerError, phrase(sip.StatusInternalServerError), nil)
 		return
 	}
 	pair, err := e.AllocateRTP(e.root)
 	if err != nil {
-		_ = e.sessionRespond(sess, sip.StatusInternalServerError, phrase(sip.StatusInternalServerError), nil)
+		_ = e.sessionRespond(d, sess, sip.StatusInternalServerError, phrase(sip.StatusInternalServerError), nil)
 		return
 	}
 	d.pair = pair
@@ -286,7 +287,7 @@ func (e *Endpoint) onNewInvite(req *sip.Request, tx sip.ServerTransaction) {
 		if errors.Is(err, ErrNoCommonCodec) {
 			code = sip.StatusNotAcceptableHere
 		}
-		_ = e.sessionRespond(sess, code, phrase(code), nil)
+		_ = e.sessionRespond(d, sess, code, phrase(code), nil)
 		return
 	}
 	d.storeSDP(raw)
@@ -299,6 +300,7 @@ func (e *Endpoint) onNewInvite(req *sip.Request, tx sip.ServerTransaction) {
 	}
 	res := sip.NewResponseFromRequest(sess.InviteRequest, sip.StatusOK, phrase(sip.StatusOK), raw)
 	e.decorate(res, true)
+	d.stamp(res, nil)
 	if h := e.noteInboundSession(d, req); h != nil {
 		res.RemoveHeader("Supported")
 		res.AppendHeader(timerSupported())
@@ -374,6 +376,9 @@ func (d *dialog) establish(offer Description) error {
 
 func (e *Endpoint) onReinvite(req *sip.Request, tx sip.ServerTransaction) {
 	d := e.findDialog(req)
+	if d != nil {
+		d.noteArrived(req)
+	}
 	if d == nil {
 		_ = e.respond(tx, req, sip.StatusCallTransactionDoesNotExists, phrase(sip.StatusCallTransactionDoesNotExists), nil)
 		return
@@ -432,6 +437,7 @@ func (e *Endpoint) onReinvite(req *sip.Request, tx sip.ServerTransaction) {
 	}
 	res := sip.NewResponseFromRequest(req, sip.StatusOK, phrase(sip.StatusOK), body)
 	e.decorate(res, len(body) > 0)
+	d.stamp(res, nil)
 	d.setAckPending(true)
 	if commit {
 		err = d.commitIfSent(remote, dir, body, func() error { return tx.Respond(res) })
@@ -460,6 +466,9 @@ func (e *Endpoint) onReinvite(req *sip.Request, tx sip.ServerTransaction) {
 
 func (e *Endpoint) onUpdate(req *sip.Request, tx sip.ServerTransaction) {
 	d := e.findDialog(req)
+	if d != nil {
+		d.noteArrived(req)
+	}
 	if d == nil {
 		_ = e.respond(tx, req, sip.StatusCallTransactionDoesNotExists, phrase(sip.StatusCallTransactionDoesNotExists), nil)
 		return
@@ -510,6 +519,7 @@ func (e *Endpoint) onUpdate(req *sip.Request, tx sip.ServerTransaction) {
 	}
 	res := sip.NewResponseFromRequest(req, sip.StatusOK, phrase(sip.StatusOK), raw)
 	e.decorate(res, true)
+	d.stamp(res, nil)
 	if err := d.commitIfSent(remote, dir, raw, func() error { return tx.Respond(res) }); err != nil {
 		return
 	}
@@ -539,6 +549,11 @@ func (e *Endpoint) onOptions(req *sip.Request, tx sip.ServerTransaction) {
 		tx.Terminate()
 		return
 	}
+	if d := e.findDialog(req); d != nil {
+		d.noteArrived(req)
+	} else {
+		e.noteArrived(req)
+	}
 	res := sip.NewResponseFromRequest(req, sip.StatusOK, phrase(sip.StatusOK), nil)
 	e.decorate(res, false)
 	if e.cfg.SessionTimer > 0 {
@@ -546,6 +561,11 @@ func (e *Endpoint) onOptions(req *sip.Request, tx sip.ServerTransaction) {
 		res.AppendHeader(timerSupported())
 	}
 	res.AppendHeader(sip.NewHeader("Accept", "application/sdp"))
+	if d := e.findDialog(req); d != nil {
+		d.stamp(res, nil)
+	} else {
+		e.stamp(res)
+	}
 	_ = tx.Respond(res)
 }
 
@@ -563,6 +583,9 @@ func (e *Endpoint) onAck(req *sip.Request, tx sip.ServerTransaction) {
 
 func (e *Endpoint) onBye(req *sip.Request, tx sip.ServerTransaction) {
 	d := e.findDialog(req)
+	if d != nil {
+		d.noteArrived(req)
+	}
 	if d == nil {
 		_ = e.respond(tx, req, sip.StatusCallTransactionDoesNotExists, phrase(sip.StatusCallTransactionDoesNotExists), nil)
 		return

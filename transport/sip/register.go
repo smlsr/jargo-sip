@@ -127,6 +127,7 @@ func (e *Endpoint) sendRegister(ctx context.Context, unregister bool) (time.Dura
 	if err != nil {
 		return 0, err
 	}
+	e.noteArrived(res)
 	if res.StatusCode == sip.StatusUnauthorized || res.StatusCode == sip.StatusProxyAuthRequired {
 		res, err = e.answerRegisterChallenge(ctx, req, res)
 		if err != nil {
@@ -184,6 +185,7 @@ func (e *Endpoint) answerRegisterChallenge(ctx context.Context, req *sip.Request
 	if err != nil {
 		return nil, err
 	}
+	e.noteArrived(got)
 	if got.StatusCode == sip.StatusUnauthorized || got.StatusCode == sip.StatusProxyAuthRequired {
 		return nil, fmt.Errorf("REGISTER challenge rejected: %d", got.StatusCode)
 	}
@@ -229,6 +231,7 @@ func (e *Endpoint) registerRequest(expires *uint32) (*sip.Request, error) {
 	}
 	req.SetDestination(dest)
 	req.Laddr = e.listen
+	e.stamp(req)
 	return req, nil
 }
 

@@ -30,6 +30,7 @@ Contract for `github.com/smlsr/jargo-sip`, package `transport/sip`. JAR-2 is doc
 | [session-timers.md](session-timers.md) | RFC 4028 refresh and expiry | JAR-11 |
 | [options.md](options.md) | OPTIONS 200, not a media operation | JAR-8, JAR-11 |
 | [pipeline-adapter.md](pipeline-adapter.md) | `NewTransport`, native DTMF, BYE, resample edge | JAR-10 |
+| [custom-headers.md](custom-headers.md) | Read and set caller headers on every message | JAR-13 |
 
 ## Public functions
 
@@ -44,6 +45,7 @@ Contract for `github.com/smlsr/jargo-sip`, package `transport/sip`. JAR-2 is doc
 | `Hold`, `Resume` | [reinvite.md](reinvite.md), [update.md](update.md) |
 | `Transfer`, `TransferAttended` | [refer.md](refer.md) |
 | `Hangup`, `Remote`, `Done` | [config.md](config.md) |
+| `SetHeader`, `Header` | [custom-headers.md](custom-headers.md) |
 | `NewTransport` | [pipeline-adapter.md](pipeline-adapter.md) |
 
 ## Pins
@@ -82,6 +84,7 @@ Each story is tested before the next. Acceptance tests in the plan are the defin
 8. JAR-9 outbound, blind REFER, attended REFER, Replaces. Blocked on JAR-8.
 9. JAR-10 `NewTransport`. Blocked on JAR-7 and JAR-9.
 10. JAR-11 REGISTER, session timers, OPTIONS against a test registrar. Blocked on JAR-8.
+11. JAR-13 custom headers on every message. Blocked on JAR-11.
 
 ## Shared acceptance
 

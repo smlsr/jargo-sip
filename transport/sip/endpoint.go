@@ -76,6 +76,10 @@ type Endpoint struct {
 	regStop   bool
 	regCancel context.CancelFunc
 	regSend   sync.Mutex
+
+	headers    headerState
+	headerOnce sync.Once
+	headerID   uint64
 }
 
 // New stores cfg. Start validates it and binds.
@@ -256,6 +260,7 @@ func (e *Endpoint) Close() error {
 		e.closeErr = e.shutdown()
 		e.serveWG.Wait()
 		e.wakeAcceptClosed()
+		e.releaseHeaders()
 	})
 	return e.closeErr
 }

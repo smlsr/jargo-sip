@@ -24,6 +24,7 @@ func (d *dialog) sendProvisional(code int, reason string) error {
 	}
 	res := sip.NewResponseFromRequest(d.sess.InviteRequest, code, reason, nil)
 	d.ep.decorate(res, false)
+	d.stamp(res, nil)
 	if reliable {
 		d.mu.Lock()
 		d.rseq++
@@ -103,6 +104,9 @@ func (d *dialog) matchRAck(req *sip.Request) bool {
 
 func (e *Endpoint) onPrack(req *sip.Request, tx sip.ServerTransaction) {
 	d := e.findDialog(req)
+	if d != nil {
+		d.noteArrived(req)
+	}
 	if d == nil {
 		_ = e.respond(tx, req, sip.StatusCallTransactionDoesNotExists, phrase(sip.StatusCallTransactionDoesNotExists), nil)
 		return

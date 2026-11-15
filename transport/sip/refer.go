@@ -40,13 +40,13 @@ func (e *Endpoint) fireReplaced(old, new *Call) {
 
 // Transfer sends a blind REFER. NOTIFY 200 ends this call. A failure
 // sipfrag, or no NOTIFY before the subscription expires, leaves it up.
-func (c *Call) Transfer(ctx context.Context, target string) error {
-	return c.refer(ctx, target, "")
+func (c *Call) Transfer(ctx context.Context, target string, headers ...Header) error {
+	return c.refer(ctx, target, "", headers)
 }
 
 // TransferAttended sends a REFER whose Refer-To is other's remote target
 // with an embedded Replaces header. other must be established.
-func (c *Call) TransferAttended(ctx context.Context, other *Call) error {
+func (c *Call) TransferAttended(ctx context.Context, other *Call, headers ...Header) error {
 	if err := other.alive(); err != nil {
 		return err
 	}
@@ -55,7 +55,7 @@ func (c *Call) TransferAttended(ctx context.Context, other *Call) error {
 		return errors.New("attended target is not established")
 	}
 	replaces := fmt.Sprintf("%s;to-tag=%s;from-tag=%s", party.CallID, party.RemoteTag, party.LocalTag)
-	return c.refer(ctx, party.RemoteTarget, replaces)
+	return c.refer(ctx, party.RemoteTarget, replaces, headers)
 }
 
 func (c *Call) alive() error {
@@ -70,7 +70,7 @@ func (c *Call) alive() error {
 	}
 }
 
-func (c *Call) refer(ctx context.Context, target, replaces string) error {
+func (c *Call) refer(ctx context.Context, target, replaces string, headers []Header) error {
 	if ctx == nil {
 		return errors.New("nil context")
 	}
@@ -107,7 +107,9 @@ func (c *Call) refer(ctx context.Context, target, replaces string) error {
 	if replaces != "" {
 		extra = append(extra, sip.NewHeader("Referred-By", fmt.Sprintf("<sip:%s@%s>", c.ep.cfg.User, c.ep.cfg.Domain)))
 	}
+	restore := d.pushHeaders(headers)
 	req, err := d.craft(sip.REFER, nil, "", extra)
+	restore()
 	if err != nil {
 		return err
 	}
@@ -202,6 +204,9 @@ func (d *dialog) holdBye() {
 
 func (e *Endpoint) onRefer(req *sip.Request, tx sip.ServerTransaction) {
 	d := e.findDialog(req)
+	if d != nil {
+		d.noteArrived(req)
+	}
 	if d == nil {
 		_ = e.respond(tx, req, sip.StatusCallTransactionDoesNotExists, phrase(sip.StatusCallTransactionDoesNotExists), nil)
 		return
@@ -256,7 +261,7 @@ func (e *Endpoint) followRefer(d *dialog, old *Call, target, replaces string) {
 			reason = phrase(code)
 		}
 		_ = d.notifyFrag(ctx, code, reason, false)
-	})
+	}, nil)
 	if err != nil {
 		code, reason := statusOf(err)
 		_ = d.notifyFrag(ctx, code, reason, true)
@@ -304,6 +309,9 @@ func (d *dialog) notifyFrag(ctx context.Context, code int, reason string, termin
 
 func (e *Endpoint) onNotify(req *sip.Request, tx sip.ServerTransaction) {
 	d := e.findDialog(req)
+	if d != nil {
+		d.noteArrived(req)
+	}
 	if d == nil {
 		_ = e.respond(tx, req, sip.StatusCallTransactionDoesNotExists, phrase(sip.StatusCallTransactionDoesNotExists), nil)
 		return
@@ -468,6 +476,7 @@ func (d *dialog) rejectEarly(code int) bool {
 	}
 	res := sip.NewResponseFromRequest(req, code, phrase(code), nil)
 	d.ep.decorate(res, false)
+	d.stamp(res, nil)
 	return tx.Respond(res) == nil
 }
 

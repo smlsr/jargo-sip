@@ -47,4 +47,12 @@
 // starts early media. ACK and CANCEL copy the INVITE CSeq. Blind REFER
 // and attended REFER with Replaces end the original dialog on NOTIFY 200.
 // OnReplaced runs before that dialog's Done channel closes.
+//
+// Caller headers ride on every request this stack sends. Names compare
+// case-insensitively. Via, Contact, CSeq, Call-ID, From, To, Max-Forwards,
+// Content-Length, Route, and Record-Route stay the stack's. Headers passed
+// to Dial are copied onto that INVITE, its ACK, and its CANCEL. Headers
+// passed to Transfer or TransferAttended are copied onto the REFER.
+// A message that arrives is stored on the Call, or on the Endpoint for
+// REGISTER, before the handler acts on it.
 package sip
