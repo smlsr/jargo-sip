@@ -1,5 +1,7 @@
 # SIP endpoint specs
 
+The product spec is [spec.md](spec.md).
+
 Contract for `github.com/smlsr/jargo-sip`, package `transport/sip`. JAR-2 is documentation only. The amendment read for this set is `internal/sip-plan.md`. Where an older line said to drop 183 audio, [early media](early-media.md) wins: this build plays 183 into the pipeline.
 
 `Endpoint` is one process, one SIP port, many calls. `Call` is one dialog, one RTP session, PCM in and out. `Transport` wraps one `Call` the way `github.com/gojargo/jargo/transport/rtc` wraps one `Connection`. There is no binary. Signaling is sipgo for transactions and dialogs only. Media is ours on `pion/rtp` and `pion/rtcp`, using G.711. sipgo `DialogServerCache` and `DialogClientCache` are examples; the call table lives on `Endpoint`.
