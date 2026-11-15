@@ -179,6 +179,7 @@ type dialog struct {
 	haveRemote   bool
 
 	offer      offerPhase
+	offerGen   uint64
 	inOffer    bool
 	outOffer   bool
 	ackPending bool
@@ -323,22 +324,25 @@ func (d *dialog) nextCSeq(method sip.RequestMethod) (uint32, error) {
 }
 
 func (d *dialog) glareLocked(method sip.RequestMethod, hasSDP bool) (code int, retry int, blocked bool) {
-	if d.offer == offerInUpdate {
-		return sip.StatusInternalServerError, randRetryAfter(), true
-	}
 	switch method {
 	case sip.INVITE:
-		if d.offer == offerOutInvite || (hasSDP && d.outOffer) {
+		if d.offer == offerOutInvite || d.offer == offerOutUpdate {
 			return sip.StatusRequestPending, 0, true
 		}
-		if d.offer == offerInInvite || (hasSDP && d.inOffer) {
+		if d.offer == offerInInvite || d.offer == offerInUpdate {
 			return sip.StatusInternalServerError, randRetryAfter(), true
 		}
 	case sip.UPDATE:
-		if hasSDP && d.outOffer {
+		if d.offer == offerInUpdate {
+			return sip.StatusInternalServerError, randRetryAfter(), true
+		}
+		if !hasSDP {
+			return 0, 0, false
+		}
+		if d.offer == offerOutInvite || d.offer == offerOutUpdate {
 			return sip.StatusRequestPending, 0, true
 		}
-		if hasSDP && d.inOffer {
+		if d.offer == offerInInvite {
 			return sip.StatusInternalServerError, randRetryAfter(), true
 		}
 	default:
@@ -347,14 +351,17 @@ func (d *dialog) glareLocked(method sip.RequestMethod, hasSDP bool) (code int, r
 	return 0, 0, false
 }
 
-func (d *dialog) beginInbound(method sip.RequestMethod, hasSDP bool) (int, int, bool) {
+func (d *dialog) beginInbound(method sip.RequestMethod, hasSDP bool) (int, int, bool, uint64) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.ended {
-		return sip.StatusCallTransactionDoesNotExists, 0, false
+		return sip.StatusCallTransactionDoesNotExists, 0, false, 0
 	}
 	if code, retry, blocked := d.glareLocked(method, hasSDP); blocked {
-		return code, retry, false
+		return code, retry, false, 0
+	}
+	if method == sip.UPDATE && !hasSDP {
+		return 0, 0, false, 0
 	}
 	switch method {
 	case sip.INVITE:
@@ -362,15 +369,16 @@ func (d *dialog) beginInbound(method sip.RequestMethod, hasSDP bool) (int, int, 
 	case sip.UPDATE:
 		d.offer = offerInUpdate
 	default:
-		return sip.StatusInternalServerError, 0, false
+		return sip.StatusInternalServerError, 0, false, 0
 	}
+	d.offerGen++
 	d.inOffer = hasSDP
-	return 0, 0, true
+	return 0, 0, true, d.offerGen
 }
 
-func (d *dialog) endInbound(phase offerPhase) {
+func (d *dialog) endInbound(phase offerPhase, gen uint64) {
 	d.mu.Lock()
-	if d.offer == phase {
+	if d.offer == phase && d.offerGen == gen {
 		d.offer = offerIdle
 		d.inOffer = false
 	}
@@ -493,6 +501,19 @@ func (d *dialog) commitMedia(remote RemoteMedia, dir Direction) error {
 	d.haveRemoteMedia = true
 	d.direction = dir
 	d.mu.Unlock()
+	return nil
+}
+
+// commitIfSent commits a re-INVITE or UPDATE only after send returns nil.
+// A failed send leaves the previous remote, direction, and SDP in place.
+func (d *dialog) commitIfSent(remote RemoteMedia, dir Direction, sdp []byte, send func() error) error {
+	if err := send(); err != nil {
+		return err
+	}
+	if err := d.commitMedia(remote, dir); err != nil {
+		return err
+	}
+	d.storeSDP(sdp)
 	return nil
 }
 

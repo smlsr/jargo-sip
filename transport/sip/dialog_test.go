@@ -722,14 +722,14 @@ func TestReliableProvisional(t *testing.T) {
 	})
 }
 
-func TestSupportedTimerWhenConfigured(t *testing.T) {
+func TestSessionTimerDoesNotAdvertiseTimer(t *testing.T) {
 	cfg := baseConfig()
 	cfg.SessionTimer = time.Minute
 	ep := startEP(t, cfg)
 	leg := newLeg(t, ep)
 	leg.invite(pcmuOffer(leg.rtpPort()), false, nil)
 	ok := leg.waitCode(200, "INVITE", 2*time.Second)
-	if !strings.Contains(ok.hdr("supported"), "100rel") || !strings.Contains(ok.hdr("supported"), "timer") {
+	if ok.hdr("supported") != "100rel" {
 		t.Fatalf("supported %q", ok.hdr("supported"))
 	}
 	leg.ack(ok)
@@ -739,6 +739,262 @@ func TestSupportedTimerWhenConfigured(t *testing.T) {
 	}
 	_ = call.Hangup(context.Background())
 }
+
+func TestOfferEndDoesNotClearNewerReservation(t *testing.T) {
+	d := &dialog{wake: make(chan struct{})}
+	_, _, ok, gen1 := d.beginInbound(sip.INVITE, true)
+	if !ok {
+		t.Fatal("first reserve failed")
+	}
+	d.endInbound(offerInInvite, gen1)
+	_, _, ok, gen2 := d.beginInbound(sip.INVITE, true)
+	if !ok {
+		t.Fatal("second reserve failed")
+	}
+	d.endInbound(offerInInvite, gen1)
+	code, _, ok, _ := d.beginInbound(sip.INVITE, true)
+	if ok || code != sip.StatusInternalServerError {
+		t.Fatalf("third begin ok=%v code=%d", ok, code)
+	}
+	d.endInbound(offerInInvite, gen2)
+	_, _, ok, _ = d.beginInbound(sip.INVITE, true)
+	if !ok {
+		t.Fatal("owner release left the offer locked")
+	}
+}
+
+func TestEmptyUpdateLeavesInviteOffer(t *testing.T) {
+	d := &dialog{wake: make(chan struct{})}
+	_, _, ok, _ := d.beginInbound(sip.INVITE, true)
+	if !ok {
+		t.Fatal("invite reserve failed")
+	}
+	code, _, reserved, _ := d.beginInbound(sip.UPDATE, false)
+	if code != 0 || reserved {
+		t.Fatalf("empty update code=%d reserved=%v", code, reserved)
+	}
+	if d.offer != offerInInvite {
+		t.Fatalf("phase %d", d.offer)
+	}
+	code, _, ok, _ = d.beginInbound(sip.INVITE, true)
+	if ok || code != sip.StatusInternalServerError {
+		t.Fatalf("second invite ok=%v code=%d", ok, code)
+	}
+
+	out := &dialog{wake: make(chan struct{}), offer: offerOutUpdate, outOffer: true}
+	code, _, ok, _ = out.beginInbound(sip.INVITE, false)
+	if ok || code != sip.StatusRequestPending {
+		t.Fatalf("empty invite during outbound update ok=%v code=%d", ok, code)
+	}
+	if out.offer != offerOutUpdate {
+		t.Fatal("empty invite replaced the outbound update")
+	}
+
+	upd := &dialog{wake: make(chan struct{}), offer: offerInUpdate}
+	code, _, ok, _ = upd.beginInbound(sip.UPDATE, false)
+	if ok || code != sip.StatusInternalServerError {
+		t.Fatalf("empty update during update ok=%v code=%d", ok, code)
+	}
+}
+
+func TestStaleOfferEndKeepsNextInvite(t *testing.T) {
+	ep := startEP(t, baseConfig())
+	held := make(chan struct{})
+	release := make(chan struct{})
+	var holdOnce sync.Once
+	var releaseOnce sync.Once
+	free := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(free)
+	ep.setBeforeFinal(func(d *dialog, req *sip.Request) {
+		if !reinviteOf(req) || req.CSeq() == nil || req.CSeq().SeqNo != 22 {
+			return
+		}
+		holdOnce.Do(func() { close(held) })
+		<-release
+	})
+	leg := newLeg(t, ep)
+	call := establish(t, ep, leg, false)
+	leg.inDialog("INVITE", pcmuDir(leg.rtpPort(), "sendonly"), 21)
+	ok := leg.waitCode(200, "INVITE", 2*time.Second)
+	time.Sleep(30 * time.Millisecond)
+	leg.inDialog("INVITE", pcmuDir(leg.rtpPort(), "sendrecv"), 22)
+	select {
+	case <-held:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second invite did not reach the handler")
+	}
+	leg.ack(ok)
+	leg.inDialog("INVITE", pcmuDir(leg.rtpPort(), "sendrecv"), 23)
+	fail := leg.waitCode(500, "INVITE", 2*time.Second)
+	n, err := strconv.Atoi(strings.TrimSpace(fail.hdr("retry-after")))
+	if err != nil || n < 0 || n > 10 {
+		t.Fatalf("Retry-After %q", fail.hdr("retry-after"))
+	}
+	free()
+	ok2 := leg.waitCode(200, "INVITE", 2*time.Second)
+	leg.ack(ok2)
+	_ = call.Hangup(context.Background())
+}
+
+func TestEmptyUpdateDoesNotClearInviteGlare(t *testing.T) {
+	ep := startEP(t, baseConfig())
+	release := make(chan struct{})
+	var once sync.Once
+	free := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(free)
+	ep.setBeforeFinal(func(d *dialog, req *sip.Request) {
+		if reinviteOf(req) {
+			<-release
+		}
+	})
+	leg := newLeg(t, ep)
+	call := establish(t, ep, leg, false)
+	leg.inDialog("INVITE", pcmuDir(leg.rtpPort(), "sendonly"), leg.cseq+1)
+	time.Sleep(30 * time.Millisecond)
+	leg.inDialog("UPDATE", "", leg.cseq+1)
+	upd := leg.waitCode(200, "UPDATE", 2*time.Second)
+	assertCommon(t, upd)
+	leg.inDialog("INVITE", pcmuDir(leg.rtpPort(), "sendrecv"), leg.cseq+1)
+	fail := leg.waitCode(500, "INVITE", 2*time.Second)
+	n, err := strconv.Atoi(strings.TrimSpace(fail.hdr("retry-after")))
+	if err != nil || n < 0 || n > 10 {
+		t.Fatalf("Retry-After %q", fail.hdr("retry-after"))
+	}
+	free()
+	ok := leg.waitCode(200, "INVITE", 2*time.Second)
+	leg.ack(ok)
+	_ = call.Hangup(context.Background())
+}
+
+func TestFailedAnswerDoesNotCommitMedia(t *testing.T) {
+	ep := startEP(t, baseConfig())
+	pair, err := ep.AllocateRTP(ep.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = pair.Close() })
+	remote := pcmuMedia("127.0.0.1", 40000, 40001)
+	media, err := StartMedia(ep.root, pair, remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = media.Close() })
+	d := &dialog{
+		ep:              ep,
+		media:           media,
+		wake:            make(chan struct{}),
+		remote:          remote,
+		haveRemoteMedia: true,
+		direction:       DirectionSendRecv,
+		localSDP:        []byte("old-sdp"),
+	}
+	next := pcmuMedia("127.0.0.1", 40010, 40011)
+	err = d.commitIfSent(next, DirectionSendOnly, []byte("new-sdp"), func() error {
+		return errors.New("not sent")
+	})
+	if err == nil {
+		t.Fatal("expected send error")
+	}
+	if d.direction != DirectionSendRecv || d.remote.RTPPort != 40000 || string(d.currentSDP()) != "old-sdp" {
+		t.Fatalf("committed dir %s port %d sdp %q", d.direction, d.remote.RTPPort, d.currentSDP())
+	}
+	if media.RTPDest().Port != 40000 {
+		t.Fatalf("dest %d", media.RTPDest().Port)
+	}
+	media.send.mu.Lock()
+	silent := media.send.forceSilence
+	media.send.mu.Unlock()
+	if silent {
+		t.Fatal("sender went silent")
+	}
+	media.mu.Lock()
+	on := media.playout
+	media.mu.Unlock()
+	if !on {
+		t.Fatal("playout stopped")
+	}
+	if err := d.commitIfSent(next, DirectionSendOnly, []byte("new-sdp"), func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if d.direction != DirectionSendOnly || d.remote.RTPPort != 40010 || string(d.currentSDP()) != "new-sdp" {
+		t.Fatalf("answer did not commit dir %s port %d sdp %q", d.direction, d.remote.RTPPort, d.currentSDP())
+	}
+}
+
+func TestWaitACKRejectsBufferedCSeq(t *testing.T) {
+	d := &dialog{
+		wake:         make(chan struct{}),
+		extraAck:     make(chan *sip.Request, 1),
+		remoteInvite: 22,
+		haveRemote:   true,
+	}
+	stale := sip.NewRequest(sip.ACK, sip.Uri{Scheme: "sip", Host: "127.0.0.1"})
+	stale.AppendHeader(&sip.CSeqHeader{SeqNo: 21, MethodName: sip.ACK})
+	d.extraAck <- stale
+	invite := sip.NewRequest(sip.INVITE, sip.Uri{Scheme: "sip", Host: "127.0.0.1"})
+	invite.AppendHeader(&sip.CSeqHeader{SeqNo: 22, MethodName: sip.INVITE})
+	res := sip.NewResponseFromRequest(invite, sip.StatusOK, "OK", nil)
+	tx := &scriptTx{acks: make(chan *sip.Request, 1), done: make(chan struct{})}
+	t.Cleanup(func() { close(tx.done) })
+	got := make(chan ackResult, 1)
+	go func() {
+		ack, err := waitACK(tx, res, d)
+		got <- ackResult{ack: ack, err: err}
+	}()
+	deadline := time.Now().Add(time.Second)
+	for len(d.extraAck) > 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("stale ack was not read")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	select {
+	case result := <-got:
+		seq := uint32(0)
+		if result.ack != nil && result.ack.CSeq() != nil {
+			seq = result.ack.CSeq().SeqNo
+		}
+		t.Fatalf("buffered ack %d finished the wait (%v)", seq, result.err)
+	default:
+	}
+	match := sip.NewRequest(sip.ACK, sip.Uri{Scheme: "sip", Host: "127.0.0.1"})
+	match.AppendHeader(&sip.CSeqHeader{SeqNo: 22, MethodName: sip.ACK})
+	tx.acks <- match
+	select {
+	case result := <-got:
+		if result.err != nil || result.ack == nil || result.ack.CSeq() == nil || result.ack.CSeq().SeqNo != 22 {
+			t.Fatalf("matching ack: %v %+v", result.err, result.ack)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("matching ack was not accepted")
+	}
+	if err := d.noteRemote(match); err != nil {
+		t.Fatal(err)
+	}
+	bad := sip.NewRequest(sip.ACK, sip.Uri{Scheme: "sip", Host: "127.0.0.1"})
+	bad.AppendHeader(&sip.CSeqHeader{SeqNo: 21, MethodName: sip.ACK})
+	if err := d.noteRemote(bad); err == nil {
+		t.Fatal("cseq mismatch was accepted")
+	}
+}
+
+type ackResult struct {
+	ack *sip.Request
+	err error
+}
+
+type scriptTx struct {
+	acks chan *sip.Request
+	done chan struct{}
+}
+
+func (s *scriptTx) Respond(*sip.Response) error        { return nil }
+func (s *scriptTx) Acks() <-chan *sip.Request          { return s.acks }
+func (s *scriptTx) OnCancel(sip.FnTxCancel) bool       { return false }
+func (s *scriptTx) Terminate()                         {}
+func (s *scriptTx) OnTerminate(sip.FnTxTerminate) bool { return false }
+func (s *scriptTx) Done() <-chan struct{}              { return s.done }
+func (s *scriptTx) Err() error                         { return nil }
 
 func assertCommon(t *testing.T, msg sipRaw) {
 	t.Helper()

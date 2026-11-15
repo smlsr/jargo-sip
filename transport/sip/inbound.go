@@ -198,9 +198,16 @@ func (e *Endpoint) onNewInvite(req *sip.Request, tx sip.ServerTransaction) {
 	d.tx = tx
 	d.noteInitial(req)
 	e.dialogs.put(d)
+	var own bool
+	var gen uint64
 	defer func() {
-		d.endInbound(offerInInvite)
-		if d.call == nil {
+		if own {
+			d.endInbound(offerInInvite, gen)
+		}
+		d.mu.Lock()
+		published := d.call
+		d.mu.Unlock()
+		if published == nil {
 			d.stopProvisional()
 			e.dialogs.drop(d.id)
 			if d.pair != nil {
@@ -209,10 +216,16 @@ func (e *Endpoint) onNewInvite(req *sip.Request, tx sip.ServerTransaction) {
 			}
 		}
 	}()
-	if _, _, ok := d.beginInbound(sip.INVITE, len(bytes.TrimSpace(req.Body())) > 0); !ok {
-		_ = e.respond(tx, req, sip.StatusInternalServerError, phrase(sip.StatusInternalServerError), nil)
+	code, _, reserved, gen := d.beginInbound(sip.INVITE, len(bytes.TrimSpace(req.Body())) > 0)
+	if !reserved {
+		status := code
+		if status == 0 {
+			status = sip.StatusInternalServerError
+		}
+		_ = e.respond(tx, req, status, phrase(status), nil)
 		return
 	}
+	own = true
 	if err := e.sessionRespond(sess, sip.StatusTrying, phrase(sip.StatusTrying), nil); err != nil {
 		return
 	}
@@ -280,7 +293,8 @@ func (e *Endpoint) onNewInvite(req *sip.Request, tx sip.ServerTransaction) {
 	}
 	sess.InviteResponse = res
 	d.capture(res)
-	d.endInbound(offerInInvite)
+	d.endInbound(offerInInvite, gen)
+	own = false
 	d.setAckPending(true)
 	d.stopProvisional()
 	ack, err := waitACK(tx, res, d)
@@ -301,7 +315,9 @@ func (e *Endpoint) onNewInvite(req *sip.Request, tx sip.ServerTransaction) {
 		return
 	}
 	call := &Call{ep: e, dlg: d, done: make(chan struct{})}
+	d.mu.Lock()
 	d.call = call
+	d.mu.Unlock()
 	if e.cfg.MaxCall > 0 {
 		call.max = time.AfterFunc(e.cfg.MaxCall, func() {
 			_ = call.Hangup(context.Background())
@@ -354,12 +370,17 @@ func (e *Endpoint) onReinvite(req *sip.Request, tx sip.ServerTransaction) {
 		_ = e.respond(tx, req, sip.StatusBadRequest, phrase(sip.StatusBadRequest), nil)
 		return
 	}
-	code, retry, ok := d.beginInbound(sip.INVITE, has)
-	if !ok {
+	code, retry, reserved, gen := d.beginInbound(sip.INVITE, has)
+	if !reserved {
 		e.glareRespond(tx, req, code, retry)
 		return
 	}
-	defer d.endInbound(offerInInvite)
+	own := true
+	defer func() {
+		if own {
+			d.endInbound(offerInInvite, gen)
+		}
+	}()
 	d.mu.Lock()
 	d.tx = tx
 	d.mu.Unlock()
@@ -389,27 +410,28 @@ func (e *Endpoint) onReinvite(req *sip.Request, tx sip.ServerTransaction) {
 		dir = gdir
 		commit = true
 	}
-	if commit {
-		if err := d.commitMedia(remote, dir); err != nil {
-			_ = e.respond(tx, req, sip.StatusInternalServerError, phrase(sip.StatusInternalServerError), nil)
-			return
-		}
-		d.storeSDP(body)
-	}
 	res := sip.NewResponseFromRequest(req, sip.StatusOK, phrase(sip.StatusOK), body)
 	e.decorate(res, len(body) > 0)
 	d.setAckPending(true)
-	if err := tx.Respond(res); err != nil {
+	if commit {
+		err = d.commitIfSent(remote, dir, body, func() error { return tx.Respond(res) })
+	} else {
+		err = tx.Respond(res)
+	}
+	if err != nil {
 		d.setAckPending(false)
 		return
 	}
-	d.endInbound(offerInInvite)
+	d.endInbound(offerInInvite, gen)
+	own = false
 	defer d.setAckPending(false)
 	ack, err := waitACK(tx, res, d)
 	if err != nil || ack == nil {
 		return
 	}
-	_ = d.noteRemote(ack)
+	if err := d.noteRemote(ack); err != nil {
+		return
+	}
 	if d.sess != nil {
 		_ = d.sess.ReadAck(ack, tx)
 	}
@@ -433,17 +455,23 @@ func (e *Endpoint) onUpdate(req *sip.Request, tx sip.ServerTransaction) {
 		_ = e.respond(tx, req, sip.StatusBadRequest, phrase(sip.StatusBadRequest), nil)
 		return
 	}
-	code, retry, ok := d.beginInbound(sip.UPDATE, has)
-	if !ok {
-		e.glareRespond(tx, req, code, retry)
-		return
-	}
-	defer d.endInbound(offerInUpdate)
-	d.storeContact(req)
-	if !has {
+	code, retry, reserved, gen := d.beginInbound(sip.UPDATE, has)
+	if !reserved {
+		if code != 0 {
+			e.glareRespond(tx, req, code, retry)
+			return
+		}
+		d.storeContact(req)
 		_ = e.respond(tx, req, sip.StatusOK, phrase(sip.StatusOK), nil)
 		return
 	}
+	own := true
+	defer func() {
+		if own {
+			d.endInbound(offerInUpdate, gen)
+		}
+	}()
+	d.storeContact(req)
 	if _, aerr := chooseAudio(desc, e.cfg); aerr != nil {
 		_ = e.respond(tx, req, sip.StatusNotAcceptableHere, phrase(sip.StatusNotAcceptableHere), nil)
 		return
@@ -458,16 +486,13 @@ func (e *Endpoint) onUpdate(req *sip.Request, tx sip.ServerTransaction) {
 		_ = e.respond(tx, req, sip.StatusNotAcceptableHere, phrase(sip.StatusNotAcceptableHere), nil)
 		return
 	}
-	if err := d.commitMedia(remote, dir); err != nil {
-		_ = e.respond(tx, req, sip.StatusInternalServerError, phrase(sip.StatusInternalServerError), nil)
-		return
-	}
-	d.storeSDP(raw)
 	res := sip.NewResponseFromRequest(req, sip.StatusOK, phrase(sip.StatusOK), raw)
 	e.decorate(res, true)
-	if err := tx.Respond(res); err != nil {
+	if err := d.commitIfSent(remote, dir, raw, func() error { return tx.Respond(res) }); err != nil {
 		return
 	}
+	d.endInbound(offerInUpdate, gen)
+	own = false
 }
 
 func (e *Endpoint) glareRespond(tx sip.ServerTransaction, req *sip.Request, code, retry int) {
@@ -524,6 +549,18 @@ func (e *Endpoint) onCancel(req *sip.Request, tx sip.ServerTransaction) {
 	_ = e.respond(tx, req, sip.StatusCallTransactionDoesNotExists, phrase(sip.StatusCallTransactionDoesNotExists), nil)
 }
 
+func ackMatches(ack *sip.Request, res *sip.Response) bool {
+	if ack == nil || res == nil {
+		return false
+	}
+	ac := ack.CSeq()
+	rc := res.CSeq()
+	if ac == nil || rc == nil {
+		return false
+	}
+	return ac.MethodName == sip.ACK && ac.SeqNo == rc.SeqNo
+}
+
 func waitACK(tx sip.ServerTransaction, res *sip.Response, d *dialog) (*sip.Request, error) {
 	timer := time.NewTimer(sip.T1)
 	defer timer.Stop()
@@ -533,9 +570,13 @@ func waitACK(tx sip.ServerTransaction, res *sip.Response, d *dialog) (*sip.Reque
 	for {
 		select {
 		case ack := <-tx.Acks():
-			return ack, nil
+			if ackMatches(ack, res) {
+				return ack, nil
+			}
 		case ack := <-d.extraAck:
-			return ack, nil
+			if ackMatches(ack, res) {
+				return ack, nil
+			}
 		case <-timer.C:
 			if err := tx.Respond(res); err != nil {
 				return nil, err

@@ -10,9 +10,6 @@ import (
 const allowMethods = "INVITE, ACK, CANCEL, BYE, UPDATE, PRACK, REFER, NOTIFY, OPTIONS"
 
 func (e *Endpoint) supportedValue() string {
-	if e.cfg.SessionTimer > 0 {
-		return "100rel, timer"
-	}
 	return "100rel"
 }
 
