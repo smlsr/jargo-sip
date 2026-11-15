@@ -213,6 +213,82 @@ func TestRegisterExpiresZeroOnClose(t *testing.T) {
 	}
 }
 
+func TestRegisterDigestTimeoutAdvancesCSeq(t *testing.T) {
+	u := newUAS(t)
+	cfg := baseConfig()
+	cfg.SIPPort = freePort(t)
+	cfg.Auth = &DigestAuth{Username: "bot", Password: "s3cret"}
+	cfg.Register = &RegisterConfig{Registrar: registrarURI(u), Expires: time.Hour}
+	firstC := make(chan sipRaw, 1)
+	digestC := make(chan sipRaw, 1)
+	go func() {
+		first := u.waitMethod("REGISTER", 2*time.Second)
+		firstC <- first
+		u.respond(first, 401, "Unauthorized", "", map[string]string{
+			"WWW-Authenticate": challenge("sip.example.com", "reg-to"),
+		})
+		digest := u.waitMethod("REGISTER", 2*time.Second)
+		digestC <- digest
+	}()
+	ep, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ep.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	err = ep.Start(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Start err %v", err)
+	}
+	first := <-firstC
+	digest := <-digestC
+	firstSeq, _ := first.cseq()
+	digestSeq, _ := digest.cseq()
+	if digest.hdr("call-id") != first.hdr("call-id") {
+		t.Fatalf("call-id %s then %s", first.hdr("call-id"), digest.hdr("call-id"))
+	}
+	if digestSeq != firstSeq+1 {
+		t.Fatalf("digest cseq %d, first %d", digestSeq, firstSeq)
+	}
+	if digest.hdr("authorization") == "" {
+		t.Fatal("digest retry missing Authorization")
+	}
+	nextC := make(chan sipRaw, 1)
+	go func() {
+		deadline := time.Now().Add(3 * time.Second)
+		for {
+			msg := u.waitMethod("REGISTER", time.Until(deadline))
+			seq, _ := msg.cseq()
+			if seq == digestSeq {
+				continue
+			}
+			nextC <- msg
+			u.respond(msg, 200, "OK", "", map[string]string{"Expires": "3600"})
+			if again, ok := u.peekMethod("REGISTER", 3*time.Second); ok {
+				u.respond(again, 200, "OK", "", nil)
+			}
+			return
+		}
+	}()
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel2()
+	if err := ep.Start(ctx2); err != nil {
+		t.Fatal(err)
+	}
+	next := <-nextC
+	nextSeq, method := next.cseq()
+	if method != "REGISTER" {
+		t.Fatalf("method %s", method)
+	}
+	if next.hdr("call-id") != digest.hdr("call-id") {
+		t.Fatalf("call-id reused as %s", next.hdr("call-id"))
+	}
+	if nextSeq <= digestSeq {
+		t.Fatalf("cseq %d reuses digest cseq %d", nextSeq, digestSeq)
+	}
+}
+
 func TestRegisterTimeoutFailsStart(t *testing.T) {
 	u := newUAS(t)
 	cfg := baseConfig()

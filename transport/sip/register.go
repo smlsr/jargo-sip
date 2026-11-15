@@ -165,15 +165,24 @@ func (e *Endpoint) answerRegisterChallenge(ctx context.Context, req *sip.Request
 	if chal.Realm != e.cfg.Domain {
 		return nil, fmt.Errorf("REGISTER challenge realm %q", chal.Realm)
 	}
-	got, err := e.sipCli.DoDigestAuth(ctx, req, res, sipgo.DigestAuth{
+	tx, err := e.sipCli.TransactionDigestAuth(ctx, req, res, sipgo.DigestAuth{
 		Username: e.authUser(),
 		Password: e.authPass(),
 	})
+	// The helper increments CSeq before it transmits. Record that value even
+	// when the send then times out, so the next REGISTER does not reuse it.
+	if cseq := req.CSeq(); cseq != nil {
+		e.noteRegCSeq(cseq.SeqNo)
+	}
+	if tx != nil {
+		defer tx.Terminate()
+	}
 	if err != nil {
 		return nil, err
 	}
-	if cseq := req.CSeq(); cseq != nil {
-		e.noteRegCSeq(cseq.SeqNo)
+	got, err := waitClientTx(ctx, tx)
+	if err != nil {
+		return nil, err
 	}
 	if got.StatusCode == sip.StatusUnauthorized || got.StatusCode == sip.StatusProxyAuthRequired {
 		return nil, fmt.Errorf("REGISTER challenge rejected: %d", got.StatusCode)
@@ -247,6 +256,10 @@ func (e *Endpoint) regRoundTrip(ctx context.Context, req *sip.Request) (*sip.Res
 		return nil, err
 	}
 	defer tx.Terminate()
+	return waitClientTx(ctx, tx)
+}
+
+func waitClientTx(ctx context.Context, tx sip.ClientTransaction) (*sip.Response, error) {
 	for {
 		select {
 		case res := <-tx.Responses():

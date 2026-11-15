@@ -132,6 +132,52 @@ func TestSessionTimerReinvite(t *testing.T) {
 	_ = call.Hangup(context.Background())
 }
 
+func TestSessionTimer491Retries(t *testing.T) {
+	cfg := baseConfig()
+	cfg.SessionTimer = 20 * time.Second
+	ep := startEP(t, cfg)
+	u := newUAS(t)
+	retried := make(chan struct{})
+	go func() {
+		inv := u.waitMethod("INVITE", 2*time.Second)
+		u.respond(inv, 200, "OK", earlyBodyString(u.rtpPort(), true), map[string]string{
+			"Allow":           "INVITE, ACK, CANCEL, BYE, UPDATE, OPTIONS",
+			"Session-Expires": "20;refresher=uac",
+		})
+		_ = u.waitMethod("ACK", 2*time.Second)
+		upd := u.waitMethod("UPDATE", 12*time.Second)
+		updSeq, _ := upd.cseq()
+		u.respond(upd, 491, "Request Pending", "", nil)
+		again := u.waitMethod("UPDATE", 6*time.Second)
+		againSeq, method := again.cseq()
+		if method != "UPDATE" || againSeq <= updSeq {
+			t.Errorf("retry cseq %d %s after %d", againSeq, method, updSeq)
+		}
+		if again.body != "" {
+			t.Errorf("retry body %q", again.body)
+		}
+		u.respond(again, 200, "OK", "", nil)
+		close(retried)
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	call, err := ep.Dial(ctx, u.uri())
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-retried:
+	case <-time.After(18 * time.Second):
+		t.Fatal("491 was not retried")
+	}
+	select {
+	case <-call.Done():
+		t.Fatal("491 hung up the call")
+	case <-time.After(300 * time.Millisecond):
+	}
+	_ = call.Hangup(context.Background())
+}
+
 func TestInboundSessionEcho(t *testing.T) {
 	cfg := baseConfig()
 	cfg.SessionTimer = 30 * time.Second

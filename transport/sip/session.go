@@ -157,10 +157,22 @@ func (d *dialog) onSessionRefresh(gen uint64) {
 		d.mu.Unlock()
 		return
 	}
+	call := d.call
 	d.mu.Unlock()
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	// No short deadline. The Call-ID owner waits 2.1–4s after a 491, and that
+	// wait has to finish so the one retry can be sent. Expiry still hangs up.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if call != nil {
+		go func() {
+			select {
+			case <-call.Done():
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+	}
 	err := d.timerRefresh(ctx)
-	cancel()
 	d.mu.Lock()
 	stale := d.ended || d.sessionGen != gen
 	d.mu.Unlock()
@@ -201,6 +213,8 @@ func (d *dialog) timerRefresh(ctx context.Context) error {
 		return err
 	}
 	if res.StatusCode == sip.StatusRequestPending {
+		// The glare wait is not clipped by a refresh deadline. A 491 is one
+		// retry, not a hangup. A dead call cancels ctx from onSessionRefresh.
 		if err := waitGlare(ctx, d.ownsCallID); err != nil {
 			return err
 		}
