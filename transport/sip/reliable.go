@@ -102,7 +102,7 @@ func (d *dialog) matchRAck(req *sip.Request) bool {
 }
 
 func (e *Endpoint) onPrack(req *sip.Request, tx sip.ServerTransaction) {
-	d := e.dialogs.get(dialogID(req))
+	d := e.findDialog(req)
 	if d == nil {
 		_ = e.respond(tx, req, sip.StatusCallTransactionDoesNotExists, phrase(sip.StatusCallTransactionDoesNotExists), nil)
 		return

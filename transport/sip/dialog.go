@@ -111,6 +111,7 @@ func (c *Call) finish() {
 			c.max.Stop()
 		}
 		if c.dlg != nil {
+			c.dlg.stopInvite()
 			c.dlg.markEnded()
 			if c.dlg.pair != nil {
 				_ = c.dlg.pair.Close()
@@ -177,6 +178,7 @@ type dialog struct {
 	remoteCSeq   uint32
 	remoteInvite uint32
 	haveRemote   bool
+	seenRemote   map[uint32]struct{}
 
 	offer      offerPhase
 	offerGen   uint64
@@ -210,6 +212,19 @@ type dialog struct {
 	pracked    uint32
 	provCancel context.CancelFunc
 	extraAck   chan *sip.Request
+
+	// Outbound INVITE and REFER.
+	uac          bool
+	finalSent    bool
+	holdFinish   bool
+	referByeSeq  uint32
+	referByeBase uint32
+	referBusy    bool
+	invite       *sip.Request
+	inviteTx     sip.ClientTransaction
+	client       *sipgo.DialogClientSession
+	prackSeen    map[uint32]struct{}
+	notes        chan referNote
 }
 
 func newDialog(ep *Endpoint, sess *sipgo.DialogServerSession) (*dialog, error) {
@@ -293,9 +308,16 @@ func (d *dialog) noteRemote(req *sip.Request) error {
 		}
 		return nil
 	default:
+		if _, seen := d.seenRemote[seq]; seen {
+			return errBadCSeq
+		}
 		if d.haveRemote && seq <= d.remoteCSeq {
 			return errBadCSeq
 		}
+		if d.seenRemote == nil {
+			d.seenRemote = map[uint32]struct{}{}
+		}
+		d.seenRemote[seq] = struct{}{}
 		d.haveRemote = true
 		d.remoteCSeq = seq
 		if cseq.MethodName == sip.INVITE {
@@ -557,6 +579,10 @@ func mediaFromOffer(offer Description, cfg Config) (RemoteMedia, Direction, erro
 }
 
 func (d *dialog) newRequest(method sip.RequestMethod, body []byte) (*sip.Request, error) {
+	return d.craft(method, body, "application/sdp", nil)
+}
+
+func (d *dialog) craft(method sip.RequestMethod, body []byte, ctype string, extra []sip.Header) (*sip.Request, error) {
 	d.mu.Lock()
 	if d.ended && method != sip.BYE {
 		d.mu.Unlock()
@@ -589,9 +615,16 @@ func (d *dialog) newRequest(method sip.RequestMethod, body []byte) (*sip.Request
 	req.AppendHeader(sip.HeaderClone(&d.ep.contact))
 	req.AppendHeader(d.ep.allowHeader())
 	req.AppendHeader(d.ep.supportedHeader())
+	for _, h := range extra {
+		if h != nil {
+			req.AppendHeader(h)
+		}
+	}
 	if len(body) > 0 {
-		ct := sip.ContentTypeHeader("application/sdp")
-		req.AppendHeader(&ct)
+		if ctype != "" {
+			ct := sip.ContentTypeHeader(ctype)
+			req.AppendHeader(&ct)
+		}
 		req.SetBody(body)
 	} else {
 		req.SetBody(nil)
@@ -607,7 +640,7 @@ func (d *dialog) newRequest(method sip.RequestMethod, body []byte) (*sip.Request
 }
 
 func (d *dialog) roundTrip(ctx context.Context, req *sip.Request) (*sip.Response, error) {
-	tx, err := d.ep.sipCli.TransactionRequest(ctx, req)
+	tx, err := d.ep.beginTx(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -669,7 +702,7 @@ func (d *dialog) ackInvite(invite *sip.Request, res *sip.Response) error {
 	}
 	ack.SetDestination(dest)
 	ack.Laddr = d.ep.listen
-	return d.ep.sipCli.WriteRequest(ack)
+	return d.ep.writeReq(ack)
 }
 
 func (d *dialog) sendBye(ctx context.Context) error {
@@ -765,6 +798,33 @@ func (t *dialogTable) drop(id string) {
 	t.mu.Lock()
 	delete(t.byID, id)
 	t.mu.Unlock()
+}
+
+func (t *dialogTable) all() []*dialog {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make([]*dialog, 0, len(t.byID))
+	for _, d := range t.byID {
+		out = append(out, d)
+	}
+	return out
+}
+
+// find matches Replaces as the UA that receives the new INVITE sees the dialog.
+// toTag is our local tag. fromTag is the peer's tag.
+func (t *dialogTable) find(callID, toTag, fromTag string) *dialog {
+	for _, d := range t.all() {
+		d.mu.Lock()
+		match := d.party.CallID == callID && d.party.LocalTag == toTag && d.party.RemoteTag == fromTag
+		d.mu.Unlock()
+		if match {
+			return d
+		}
+	}
+	return nil
 }
 
 func (t *dialogTable) calls() []*Call {

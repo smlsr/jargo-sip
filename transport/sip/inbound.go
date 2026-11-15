@@ -68,6 +68,8 @@ func (e *Endpoint) openSIP(advIP net.IP, advPort int, udp *net.UDPConn, tcp *net
 	srv.OnUpdate(e.onUpdate)
 	srv.OnPrack(e.onPrack)
 	srv.OnCancel(e.onCancel)
+	srv.OnRefer(e.onRefer)
+	srv.OnNotify(e.onNotify)
 	e.serveWG.Add(1)
 	go func() {
 		defer e.serveWG.Done()
@@ -183,6 +185,11 @@ func (e *Endpoint) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 }
 
 func (e *Endpoint) onNewInvite(req *sip.Request, tx sip.ServerTransaction) {
+	victim, code := e.screenReplaces(req)
+	if code != 0 {
+		_ = e.respond(tx, req, code, phrase(code), nil)
+		return
+	}
 	sess, err := e.dialogUA().ReadInvite(req, tx)
 	if err != nil {
 		_ = e.respond(tx, req, sip.StatusBadRequest, phrase(sip.StatusBadRequest), nil)
@@ -283,7 +290,10 @@ func (e *Endpoint) onNewInvite(req *sip.Request, tx sip.ServerTransaction) {
 	}
 	d.storeSDP(raw)
 	e.runBeforeFinal(d, req)
-	if cancelled.Load() || d.ended {
+	if cancelled.Load() || d.isEnded() {
+		return
+	}
+	if !d.claimFinal() {
 		return
 	}
 	res := sip.NewResponseFromRequest(sess.InviteRequest, sip.StatusOK, phrase(sip.StatusOK), raw)
@@ -323,6 +333,9 @@ func (e *Endpoint) onNewInvite(req *sip.Request, tx sip.ServerTransaction) {
 			_ = call.Hangup(context.Background())
 		})
 	}
+	if victim != nil {
+		e.completeReplace(victim, call)
+	}
 	e.deliver(call)
 }
 
@@ -353,7 +366,7 @@ func (d *dialog) establish(offer Description) error {
 }
 
 func (e *Endpoint) onReinvite(req *sip.Request, tx sip.ServerTransaction) {
-	d := e.dialogs.get(dialogID(req))
+	d := e.findDialog(req)
 	if d == nil {
 		_ = e.respond(tx, req, sip.StatusCallTransactionDoesNotExists, phrase(sip.StatusCallTransactionDoesNotExists), nil)
 		return
@@ -438,7 +451,7 @@ func (e *Endpoint) onReinvite(req *sip.Request, tx sip.ServerTransaction) {
 }
 
 func (e *Endpoint) onUpdate(req *sip.Request, tx sip.ServerTransaction) {
-	d := e.dialogs.get(dialogID(req))
+	d := e.findDialog(req)
 	if d == nil {
 		_ = e.respond(tx, req, sip.StatusCallTransactionDoesNotExists, phrase(sip.StatusCallTransactionDoesNotExists), nil)
 		return
@@ -507,7 +520,7 @@ func (e *Endpoint) glareRespond(tx sip.ServerTransaction, req *sip.Request, code
 }
 
 func (e *Endpoint) onAck(req *sip.Request, tx sip.ServerTransaction) {
-	d := e.dialogs.get(dialogID(req))
+	d := e.findDialog(req)
 	if d == nil {
 		return
 	}
@@ -519,23 +532,41 @@ func (e *Endpoint) onAck(req *sip.Request, tx sip.ServerTransaction) {
 }
 
 func (e *Endpoint) onBye(req *sip.Request, tx sip.ServerTransaction) {
-	d := e.dialogs.get(dialogID(req))
+	d := e.findDialog(req)
 	if d == nil {
 		_ = e.respond(tx, req, sip.StatusCallTransactionDoesNotExists, phrase(sip.StatusCallTransactionDoesNotExists), nil)
 		return
 	}
+	d.mu.Lock()
+	held := d.holdFinish || d.notes != nil
+	base := uint32(0)
+	if d.haveRemote {
+		base = d.remoteCSeq
+	}
+	d.mu.Unlock()
 	if err := d.noteRemote(req); err != nil {
 		_ = e.respond(tx, req, sip.StatusInternalServerError, phrase(sip.StatusInternalServerError), nil)
 		return
+	}
+	if held {
+		if cseq := req.CSeq(); cseq != nil && cseq.SeqNo > base {
+			d.mu.Lock()
+			d.referByeBase = base
+			d.referByeSeq = cseq.SeqNo
+			d.mu.Unlock()
+		}
 	}
 	_ = e.respond(tx, req, sip.StatusOK, phrase(sip.StatusOK), nil)
 	d.mu.Lock()
 	d.byeSent = true
 	call := d.call
+	held = d.holdFinish || d.notes != nil
 	d.mu.Unlock()
 	d.markEnded()
 	if call != nil {
-		call.finish()
+		if !held {
+			call.finish()
+		}
 		return
 	}
 	e.dialogs.drop(d.id)
@@ -619,6 +650,17 @@ func parseSDPText(raw string) (Description, error) {
 		text += "\r\n"
 	}
 	return Parse(text)
+}
+
+func (e *Endpoint) findDialog(req *sip.Request) *dialog {
+	if d := e.dialogs.get(dialogID(req)); d != nil {
+		return d
+	}
+	id, err := sip.DialogIDFromRequestUAC(req)
+	if err != nil {
+		return nil
+	}
+	return e.dialogs.get(id)
 }
 
 func dialogID(req *sip.Request) string {
