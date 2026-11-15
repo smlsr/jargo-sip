@@ -358,6 +358,45 @@ func TestFarRunIsAdopted(t *testing.T) {
 	}
 }
 
+func TestAdoptAcrossSequenceWrap(t *testing.T) {
+	j := testJitter(40*time.Millisecond, 20*time.Millisecond, 200*time.Millisecond)
+	now := time.Unix(1, 0)
+	j.pushAudio(7, 65300, pcmTone(1), now)
+	j.pushAudio(7, 65301, pcmTone(2), now)
+	if _, ok := j.step(now); !ok {
+		t.Fatal("did not start")
+	}
+	played, ok := j.step(now)
+	if !ok || !bytes.Equal(played, pcmTone(2)) {
+		t.Fatal("playout did not reach seq 65301")
+	}
+	hi := pcmTone(3)
+	lo := pcmTone(4)
+	j.pushAudio(7, 65534, hi, now)
+	j.pushAudio(7, 0, lo, now)
+	fHi, ok := j.step(now)
+	if !ok || !bytes.Equal(fHi, hi) {
+		t.Fatal("adopted seq 65534 did not play")
+	}
+	conceal, ok := j.step(now.Add(tickInterval))
+	if !ok || !bytes.Equal(conceal, hi) {
+		t.Fatal("the wrapped hole was not one concealment")
+	}
+	fLo, ok := j.step(now.Add(60*time.Millisecond + time.Nanosecond))
+	if !ok || !bytes.Equal(fLo, lo) {
+		t.Fatal("adopted seq 0 did not play")
+	}
+	loss, have := j.loss()
+	if !have || loss.total != 1 || loss.ext != 0x10000 || loss.frac == 255 {
+		t.Fatalf("wrap loss %+v", loss)
+	}
+	j.pushAudio(7, 1, pcmTone(5), now.Add(60*time.Millisecond+time.Nanosecond))
+	loss, have = j.loss()
+	if !have || loss.total != 1 || loss.ext != 0x10000+1 {
+		t.Fatalf("seq 1 left loss saturated %+v", loss)
+	}
+}
+
 func TestLossCountsGapNotEvent(t *testing.T) {
 	j := testJitter(40*time.Millisecond, 20*time.Millisecond, 200*time.Millisecond)
 	now := time.Unix(1, 0)

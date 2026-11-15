@@ -597,7 +597,14 @@ func (j *jitter) running() bool {
 }
 
 func (st *seqState) rebase(ssrc uint32, base, max uint16, got uint32) {
-	*st = seqState{have: true, ssrc: ssrc, base: base, max: max, got: got}
+	// A window that crosses the uint16 wrap has a high base and a low max.
+	// One cycle keeps ext-base from underflowing into a saturated loss count.
+	// A pair that does not wrap leaves cycles at 0; a later note adds the cycle.
+	var cycles uint32
+	if max < base {
+		cycles = 0x10000
+	}
+	*st = seqState{have: true, ssrc: ssrc, cycles: cycles, base: base, max: max, got: got}
 }
 
 func (st *seqState) note(ssrc uint32, seq uint16) {
