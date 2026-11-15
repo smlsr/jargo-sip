@@ -127,10 +127,8 @@ func checkRTP(min, max int) error {
 	if min%2 != 0 || max%2 != 0 {
 		return fmt.Errorf("%w (%d-%d)", ErrRTPRange, min, max)
 	}
-	// An even RTP port and its RTCP port (RTP+1) both have to fit.
-	if min+1 > max {
-		return fmt.Errorf("%w (%d-%d)", ErrRTPRange, min, max)
-	}
+	// Both ends are even and min <= max, so the span holds at least one even port.
+	// RTCP is the next port and may sit one past RTPPortMax.
 	return nil
 }
 
