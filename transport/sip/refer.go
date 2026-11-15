@@ -88,6 +88,9 @@ func (c *Call) refer(ctx context.Context, target, replaces string) error {
 		return errors.New("call has ended")
 	}
 	d.notes = notes
+	// Hold Done across the subscription. A BYE pipelined with NOTIFY must
+	// not finish the call before the sipfrag is read.
+	d.holdFinish = true
 	d.mu.Unlock()
 	defer func() {
 		d.mu.Lock()
@@ -96,6 +99,7 @@ func (c *Call) refer(ctx context.Context, target, replaces string) error {
 		}
 		d.mu.Unlock()
 	}()
+	defer c.finishReferWait()
 
 	extra := []sip.Header{sip.NewHeader("Refer-To", referToValue(target, replaces))}
 	if replaces != "" {
@@ -147,8 +151,44 @@ func (c *Call) refer(ctx context.Context, target, replaces string) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-c.done:
+			if note, ok := pullNote(notes); ok {
+				if note.code >= 200 && note.code < 300 {
+					return nil
+				}
+				if note.code >= 300 {
+					if note.code == 0 {
+						note.code = sip.StatusRequestTimeout
+					}
+					return &sipStatusError{code: note.code}
+				}
+			}
 			return errors.New("call has ended")
 		}
+	}
+}
+
+// finishReferWait drops the BYE hold. A peer BYE that arrived during the
+// subscription ends the call now. A failed transfer with no BYE leaves it up.
+func (c *Call) finishReferWait() {
+	if c == nil || c.dlg == nil {
+		return
+	}
+	d := c.dlg
+	d.mu.Lock()
+	ended := d.ended
+	d.holdFinish = false
+	d.mu.Unlock()
+	if ended {
+		c.finish()
+	}
+}
+
+func pullNote(notes <-chan referNote) (referNote, bool) {
+	select {
+	case n := <-notes:
+		return n, true
+	default:
+		return referNote{}, false
 	}
 }
 
@@ -267,8 +307,10 @@ func (e *Endpoint) onNotify(req *sip.Request, tx sip.ServerTransaction) {
 		return
 	}
 	if err := d.noteRemote(req); err != nil {
-		_ = e.respond(tx, req, sip.StatusInternalServerError, phrase(sip.StatusInternalServerError), nil)
-		return
+		if !d.lateReferNotify(req) {
+			_ = e.respond(tx, req, sip.StatusInternalServerError, phrase(sip.StatusInternalServerError), nil)
+			return
+		}
 	}
 	ev := req.GetHeader("Event")
 	if ev == nil || !strings.HasPrefix(strings.ToLower(strings.TrimSpace(ev.Value())), "refer") {
@@ -280,8 +322,36 @@ func (e *Endpoint) onNotify(req *sip.Request, tx sip.ServerTransaction) {
 	if sub := req.GetHeader("Subscription-State"); sub != nil {
 		terminated = strings.Contains(strings.ToLower(sub.Value()), "terminated")
 	}
-	_ = e.respond(tx, req, sip.StatusOK, phrase(sip.StatusOK), nil)
+	d.holdBye()
 	d.pushNote(referNote{code: code, terminated: terminated})
+	_ = e.respond(tx, req, sip.StatusOK, phrase(sip.StatusOK), nil)
+}
+
+// lateReferNotify accepts one refer NOTIFY whose CSeq lost the race to a
+// pipelined BYE. The BYE already moved the remote sequence forward, and
+// dropping this sipfrag would fail a transfer that the peer completed.
+func (d *dialog) lateReferNotify(req *sip.Request) bool {
+	cseq := req.CSeq()
+	if cseq == nil || cseq.MethodName != sip.NOTIFY {
+		return false
+	}
+	ev := req.GetHeader("Event")
+	if ev == nil || !strings.HasPrefix(strings.ToLower(strings.TrimSpace(ev.Value())), "refer") {
+		return false
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.notes == nil || !d.holdFinish {
+		return false
+	}
+	if _, seen := d.seenRemote[cseq.SeqNo]; seen {
+		return false
+	}
+	if d.seenRemote == nil {
+		d.seenRemote = map[uint32]struct{}{}
+	}
+	d.seenRemote[cseq.SeqNo] = struct{}{}
+	return true
 }
 
 func (d *dialog) pushNote(n referNote) {

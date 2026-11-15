@@ -269,6 +269,93 @@ func TestDialReliable183(t *testing.T) {
 	_ = call.Hangup(context.Background())
 }
 
+func TestDialPrackRetriesAfterFailure(t *testing.T) {
+	ep := startEP(t, baseConfig())
+	u := newUAS(t)
+	body := earlyBodyString(u.rtpPort(), true)
+	hdrs := map[string]string{"Require": "100rel", "RSeq": "1"}
+	go func() {
+		inv := u.waitMethod("INVITE", 2*time.Second)
+		invSeq, _ := inv.cseq()
+		u.respond(inv, 183, "Session Progress", body, hdrs)
+		first := u.waitMethod("PRACK", 2*time.Second)
+		u.respond(first, 500, "Server Internal Error", "", nil)
+		u.respond(inv, 183, "Session Progress", body, hdrs)
+		second := u.waitMethod("PRACK", 2*time.Second)
+		firstSeq, _ := first.cseq()
+		secondSeq, _ := second.cseq()
+		if secondSeq == firstSeq {
+			t.Errorf("retry kept cseq %d", secondSeq)
+		}
+		if second.hdr("rack") != fmt.Sprintf("1 %d INVITE", invSeq) {
+			t.Errorf("RAck %q", second.hdr("rack"))
+		}
+		u.respond(second, 200, "OK", "", nil)
+		u.respond(inv, 183, "Session Progress", body, hdrs)
+		if extra, ok := u.peekMethod("PRACK", 250*time.Millisecond); ok {
+			t.Errorf("third PRACK\n%s", extra.raw)
+		}
+		u.respond(inv, 200, "OK", body, nil)
+		ack := u.waitMethod("ACK", 2*time.Second)
+		ackSeq, _ := ack.cseq()
+		if ackSeq != invSeq {
+			t.Errorf("ack cseq %d invite %d", ackSeq, invSeq)
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	call, err := ep.Dial(ctx, u.uri())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = call.Hangup(context.Background())
+}
+
+func TestDialBadEarlyMediaCancels(t *testing.T) {
+	ep := startEP(t, baseConfig())
+	u := newUAS(t)
+	go func() {
+		inv := u.waitMethod("INVITE", 2*time.Second)
+		invSeq, _ := inv.cseq()
+		u.respond(inv, 183, "Session Progress", "this is not sdp\r\n", nil)
+		got := u.waitMethod("CANCEL", 2*time.Second)
+		seq, method := got.cseq()
+		if method != "CANCEL" || seq != invSeq {
+			t.Errorf("cancel cseq %d %s, invite %d", seq, method, invSeq)
+		}
+		u.respond(got, 200, "OK", "", nil)
+		u.respond(inv, 487, "Request Terminated", "", nil)
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, err := ep.Dial(ctx, u.uri()); err == nil {
+		t.Fatal("unparseable 183 returned a call")
+	}
+}
+
+func TestDialTimeoutSendsCancel(t *testing.T) {
+	prev1, prev2, prev4 := sip.T1, sip.T2, sip.T4
+	sip.SetTimers(time.Millisecond, 4*time.Millisecond, 5*time.Millisecond)
+	t.Cleanup(func() { sip.SetTimers(prev1, prev2, prev4) })
+	ep := startEP(t, baseConfig())
+	u := newUAS(t)
+	go func() {
+		inv := u.waitMethod("INVITE", time.Second)
+		invSeq, _ := inv.cseq()
+		got := u.waitMethod("CANCEL", time.Second)
+		seq, method := got.cseq()
+		if method != "CANCEL" || seq != invSeq {
+			t.Errorf("cancel cseq %d %s, invite %d", seq, method, invSeq)
+		}
+		u.respond(got, 200, "OK", "", nil)
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := ep.Dial(ctx, u.uri()); err == nil {
+		t.Fatal("timed out dial returned a call")
+	}
+}
+
 func TestDialAuthEndpoint(t *testing.T) {
 	calleeCfg := baseConfig()
 	calleeCfg.RequireAuth = true
@@ -567,6 +654,44 @@ func TestReferFailureLeavesCall(t *testing.T) {
 	_ = call.Hangup(context.Background())
 }
 
+func TestReferNotifySurvivesBye(t *testing.T) {
+	ep := startEP(t, baseConfig())
+	u := newUAS(t)
+	go func() {
+		inv := u.waitMethod("INVITE", 2*time.Second)
+		u.respond(inv, 200, "OK", earlyBodyString(u.rtpPort(), true), nil)
+		_ = u.waitMethod("ACK", 2*time.Second)
+		ref := u.waitMethod("REFER", 2*time.Second)
+		u.respond(ref, 202, "Accepted", "", map[string]string{"Expires": "30"})
+		u.inDialog(ref, "BYE", 3, "", nil)
+		if resp := u.waitCode(200, "BYE", 2*time.Second); resp.code != 200 {
+			t.Errorf("bye response %d", resp.code)
+		}
+		u.inDialog(ref, "NOTIFY", 2, "SIP/2.0 200 OK\r\n", map[string]string{
+			"Event":              "refer",
+			"Subscription-State": "terminated;reason=noresource",
+			"Content-Type":       "message/sipfrag;version=2.0",
+		})
+		if resp := u.waitCode(200, "NOTIFY", 2*time.Second); resp.code != 200 {
+			t.Errorf("notify response %d", resp.code)
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	call, err := ep.Dial(ctx, u.uri())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := call.Transfer(ctx, "sip:carol@127.0.0.1:9"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-call.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("original call stayed up")
+	}
+}
+
 func TestReferExpires(t *testing.T) {
 	ep := startEP(t, baseConfig())
 	u := newUAS(t)
@@ -834,32 +959,33 @@ func (u *uas) respond(req sipRaw, code int, reason, body string, extra map[strin
 
 func (u *uas) notify(refer sipRaw, body, state string) {
 	u.t.Helper()
+	u.inDialog(refer, "NOTIFY", 2, body, map[string]string{
+		"Event":              "refer",
+		"Subscription-State": state,
+		"Content-Type":       "message/sipfrag;version=2.0",
+	})
+}
+
+func (u *uas) inDialog(refer sipRaw, method string, cseq int, body string, extra map[string]string) {
+	u.t.Helper()
 	u.mu.Lock()
 	peer := u.peer
 	u.mu.Unlock()
-	contact := uriIn(refer.hdr("contact"))
-	if contact == "" {
-		contact = refer.hdr("from")
-	}
-	target := contact
-	if i := strings.Index(target, ";"); i >= 0 && !strings.Contains(target, "tag=") {
-		// keep transport params
-	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "NOTIFY %s SIP/2.0\r\n", uriIn(refer.hdr("contact")))
+	fmt.Fprintf(&b, "%s %s SIP/2.0\r\n", method, uriIn(refer.hdr("contact")))
 	fmt.Fprintf(&b, "Via: SIP/2.0/UDP %s;branch=%s\r\n", u.conn.LocalAddr().String(), sip.GenerateBranch())
 	fmt.Fprintf(&b, "From: %s\r\n", refer.hdr("to"))
 	fmt.Fprintf(&b, "To: %s\r\n", refer.hdr("from"))
 	fmt.Fprintf(&b, "Call-ID: %s\r\n", refer.hdr("call-id"))
-	fmt.Fprintf(&b, "CSeq: 2 NOTIFY\r\n")
+	fmt.Fprintf(&b, "CSeq: %d %s\r\n", cseq, method)
 	fmt.Fprintf(&b, "Contact: <sip:bob@%s>\r\n", u.conn.LocalAddr().String())
-	b.WriteString("Event: refer\r\n")
-	fmt.Fprintf(&b, "Subscription-State: %s\r\n", state)
-	b.WriteString("Content-Type: message/sipfrag;version=2.0\r\n")
+	for k, v := range extra {
+		fmt.Fprintf(&b, "%s: %s\r\n", k, v)
+	}
 	fmt.Fprintf(&b, "Content-Length: %d\r\n\r\n", len(body))
 	b.WriteString(body)
 	if _, err := u.conn.WriteToUDP([]byte(b.String()), peer); err != nil {
-		u.t.Fatalf("notify: %v", err)
+		u.t.Fatalf("%s: %v", method, err)
 	}
 }
 

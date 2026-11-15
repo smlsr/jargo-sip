@@ -171,68 +171,89 @@ func (d *dialog) waitInvite(ctx context.Context, tx sip.ClientTransaction, invit
 	authTries := 0
 	saw1xx := false
 	for {
+		var res *sip.Response
+		ended := false
 		select {
-		case res, ok := <-tx.Responses():
+		case got, ok := <-tx.Responses():
 			if !ok {
-				return nil, errors.New("transaction ended")
+				return d.failBeforeAnswer(invite, errors.New("transaction ended"))
 			}
-			if res == nil {
-				continue
-			}
-			d.learnResponse(res, invite)
-			if res.IsProvisional() {
-				saw1xx = true
-				if res.StatusCode == sip.StatusSessionInProgress {
-					if err := d.playEarly(res, offered); err != nil {
-						return nil, err
-					}
-				}
-				if progress != nil && res.StatusCode > sip.StatusTrying {
-					progress(res.StatusCode, reasonText(res))
-				}
-				_ = d.prack(ctx, res, invite)
-				continue
-			}
-			if res.StatusCode == sip.StatusUnauthorized || res.StatusCode == sip.StatusProxyAuthRequired {
-				if authTries >= 1 || eAuthMissing(d.ep) {
-					return nil, &sipStatusError{code: res.StatusCode}
-				}
-				authTries++
-				next, err := d.retryAuth(ctx, tx, invite, res)
-				if err != nil {
-					return nil, err
-				}
-				tx = next
-				continue
-			}
-			if res.StatusCode != sip.StatusOK {
-				return nil, &sipStatusError{code: res.StatusCode}
-			}
-			if err := d.ackOutbound(invite, res); err != nil {
-				return nil, err
-			}
-			if err := d.confirm(res, offered); err != nil {
-				_ = d.sendBye(context.Background())
-				return nil, err
-			}
-			return d.publish(), nil
+			res = got
 		case <-tx.Done():
-			if saw1xx {
-				_ = d.sendCancel(invite)
+			ended = true
+			select {
+			case got, ok := <-tx.Responses():
+				if ok {
+					res = got
+				}
+			default:
 			}
-			if err := tx.Err(); err != nil {
-				return nil, err
-			}
-			return nil, errors.New("transaction ended")
 		case <-ctx.Done():
-			res := d.abortInvite(tx, invite, saw1xx)
-			if res != nil && res.StatusCode == sip.StatusOK {
-				_ = d.ackOutbound(invite, res)
+			final := d.abortInvite(tx, invite, saw1xx)
+			if final != nil && final.StatusCode == sip.StatusOK {
+				_ = d.ackOutbound(invite, final)
 				_ = d.sendBye(context.Background())
 			}
 			return nil, ctx.Err()
 		}
+		if res == nil {
+			if ended {
+				err := tx.Err()
+				if err == nil {
+					err = errors.New("transaction ended")
+				}
+				return d.failBeforeAnswer(invite, err)
+			}
+			continue
+		}
+		d.learnResponse(res, invite)
+		if res.IsProvisional() {
+			saw1xx = true
+			if res.StatusCode == sip.StatusSessionInProgress {
+				if err := d.playEarly(res, offered); err != nil {
+					return d.failBeforeAnswer(invite, err)
+				}
+			}
+			if progress != nil && res.StatusCode > sip.StatusTrying {
+				progress(res.StatusCode, reasonText(res))
+			}
+			_ = d.prack(ctx, res, invite)
+			continue
+		}
+		if res.StatusCode == sip.StatusUnauthorized || res.StatusCode == sip.StatusProxyAuthRequired {
+			if authTries >= 1 || eAuthMissing(d.ep) {
+				return nil, &sipStatusError{code: res.StatusCode}
+			}
+			authTries++
+			next, err := d.retryAuth(ctx, tx, invite, res)
+			if err != nil {
+				return nil, err
+			}
+			tx = next
+			continue
+		}
+		if res.StatusCode != sip.StatusOK {
+			return nil, &sipStatusError{code: res.StatusCode}
+		}
+		if err := d.ackOutbound(invite, res); err != nil {
+			return nil, err
+		}
+		if err := d.confirm(res, offered); err != nil {
+			_ = d.sendBye(context.Background())
+			return nil, err
+		}
+		return d.publish(), nil
 	}
+}
+
+// failBeforeAnswer cancels an INVITE that has not reached 200. A final
+// response is not this path: that response is already acknowledged.
+func (d *dialog) failBeforeAnswer(invite *sip.Request, err error) (*Call, error) {
+	_ = d.sendCancel(invite)
+	if err == nil {
+		err = errors.New("transaction ended")
+	}
+	return nil, err
 }
 
 func eAuthMissing(e *Endpoint) bool {
@@ -422,14 +443,10 @@ func (d *dialog) prack(ctx context.Context, res *sip.Response, invite *sip.Reque
 		return nil
 	}
 	d.mu.Lock()
-	if d.prackSeen == nil {
-		d.prackSeen = map[uint32]struct{}{}
-	}
 	if _, seen := d.prackSeen[rseq]; seen {
 		d.mu.Unlock()
 		return nil
 	}
-	d.prackSeen[rseq] = struct{}{}
 	inviteSeq := uint32(0)
 	if cseq := invite.CSeq(); cseq != nil {
 		inviteSeq = cseq.SeqNo
@@ -440,8 +457,20 @@ func (d *dialog) prack(ctx context.Context, res *sip.Response, invite *sip.Reque
 	if err != nil {
 		return err
 	}
-	_, err = d.roundTrip(ctx, req)
-	return err
+	got, err := d.roundTrip(ctx, req)
+	if err != nil {
+		return err
+	}
+	if got.StatusCode < 200 || got.StatusCode >= 300 {
+		return &sipStatusError{code: got.StatusCode}
+	}
+	d.mu.Lock()
+	if d.prackSeen == nil {
+		d.prackSeen = map[uint32]struct{}{}
+	}
+	d.prackSeen[rseq] = struct{}{}
+	d.mu.Unlock()
+	return nil
 }
 
 func responseRSeq(res *sip.Response) (uint32, bool) {

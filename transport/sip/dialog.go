@@ -178,6 +178,7 @@ type dialog struct {
 	remoteCSeq   uint32
 	remoteInvite uint32
 	haveRemote   bool
+	seenRemote   map[uint32]struct{}
 
 	offer      offerPhase
 	offerGen   uint64
@@ -305,9 +306,16 @@ func (d *dialog) noteRemote(req *sip.Request) error {
 		}
 		return nil
 	default:
+		if _, seen := d.seenRemote[seq]; seen {
+			return errBadCSeq
+		}
 		if d.haveRemote && seq <= d.remoteCSeq {
 			return errBadCSeq
 		}
+		if d.seenRemote == nil {
+			d.seenRemote = map[uint32]struct{}{}
+		}
+		d.seenRemote[seq] = struct{}{}
 		d.haveRemote = true
 		d.remoteCSeq = seq
 		if cseq.MethodName == sip.INVITE {
