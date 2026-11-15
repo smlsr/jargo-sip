@@ -395,6 +395,11 @@ func (m *Media) takeRTP(b []byte, addr *net.UDPAddr, now time.Time) {
 
 func (m *Media) ingest(acc rtpAccept, now time.Time) {
 	if acc.audio {
+		// Audio has its own RTP timestamp. A timestamp other than the open
+		// press completes that press when the end bit never arrived.
+		if m.tones != nil {
+			m.tones.noteTimestamp(acc.ssrc, acc.ts)
+		}
 		pcm, err := decodePayload(m.send.codecName(), acc.payload)
 		if err != nil || (len(pcm) != frameBytes && len(pcm) != frameBytes/2) {
 			m.play.count(acc.ssrc, acc.seq)

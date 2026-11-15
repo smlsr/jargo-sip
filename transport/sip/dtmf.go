@@ -120,9 +120,9 @@ func (d *dtmfRecv) observe(ssrc, ts uint32, payload []byte) {
 	end := payload[1]&0x80 != 0
 	dur := binary.BigEndian.Uint16(payload[2:4])
 	key := dtmfKey{ssrc: ssrc, ts: ts, event: event}
-	allowed := fmtpAllows(d.fmtp, event)
-	if !allowed {
-		if d.cur != nil && d.cur.key != key {
+	if !fmtpAllows(d.fmtp, event) {
+		// The event itself is dropped. Its timestamp still ends an open press.
+		if d.cur != nil && (d.cur.key.ssrc != ssrc || d.cur.key.ts != ts) {
 			d.finishOpen()
 		}
 		return
@@ -137,15 +137,33 @@ func (d *dtmfRecv) observe(ssrc, ts uint32, payload []byte) {
 		}
 		return
 	}
-	d.finishOpen()
+	// A repeat of a press already emitted is not a new timestamp. Closing the
+	// open press here would emit the next digit before its own end.
 	if _, seen := d.done[key]; seen {
-		d.cur = &dtmfPress{key: key, dur: dur, ended: end, emitted: true}
 		return
 	}
+	d.finishOpen()
 	d.cur = &dtmfPress{key: key, dur: dur, ended: end}
 	if end {
 		d.emit(d.cur)
 	}
+}
+
+// noteTimestamp completes an open press when a later RTP packet, including
+// audio, carries a different timestamp. The packet is not itself a digit.
+func (d *dtmfRecv) noteTimestamp(ssrc, ts uint32) {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed || !d.on || d.cur == nil {
+		return
+	}
+	if d.cur.key.ssrc != ssrc || d.cur.key.ts == ts {
+		return
+	}
+	d.finishOpen()
 }
 
 func (d *dtmfRecv) finishOpen() {

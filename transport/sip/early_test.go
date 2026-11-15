@@ -121,6 +121,47 @@ func TestEarlyMediaPlaysBefore200(t *testing.T) {
 	}
 }
 
+func TestEarlyMediaKeepsUnreadFrames(t *testing.T) {
+	cfg := baseConfig()
+	cfg.Jitter.Target = 20 * time.Millisecond
+	ep := startEP(t, cfg)
+	pair, err := ep.AllocateRTP(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := listenLoop(t)
+	port := peer.LocalAddr().(*net.UDPAddr).Port
+	offered := offeredSDP(t, ep, pair)
+	body := earlyBody(port, true)
+	m, err := ApplyEarly(context.Background(), pair, nil, offered, body)
+	if err != nil || m == nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
+	const n = 40
+	payloads := make([][]byte, n)
+	for i := 0; i < n; i++ {
+		payloads[i] = bytes.Repeat([]byte{byte(i + 1)}, frameSamples)
+		injectAt(t, m, mustPkt(t, uint16(i+1), uint32(i+1)*160, 77, 0, payloads[i]))
+	}
+	waitFor(t, 3*time.Second, func() bool { return m.play.queued() >= n })
+	ssrc := m.Stats().SSRC
+	same, err := ConfirmAnswer(context.Background(), pair, m, offered, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if same != m || m.Stats().SSRC != ssrc || m.play.queued() < n {
+		t.Fatalf("200 dropped unread frames queued %d", m.play.queued())
+	}
+	for i, p := range payloads {
+		frame := awaitPCM(t, m, time.Second)
+		want := g711.DecodeULaw(p)
+		if len(frame) != frameBytes || !bytes.Equal(frame, want) {
+			t.Fatalf("frame %d len %d", i, len(frame))
+		}
+	}
+}
+
 func TestEarlyMediaWithoutTelephoneEventStillConnects(t *testing.T) {
 	ep := startEP(t, baseConfig())
 	pair, err := ep.AllocateRTP(context.Background())

@@ -10,7 +10,6 @@ const (
 	// 200 ms maximum so a burst can sit ahead of the playout head.
 	jitterRing = 128
 	adaptEvery = 2 * time.Second
-	maxPlayout = 32
 )
 
 // jitter is a 20 ms sequence ring. Pion's interceptor jitter buffer is not used.
@@ -417,12 +416,16 @@ func (j *jitter) adapt(now time.Time) {
 	j.missed = false
 }
 
+// enqueue keeps every frame the playout clock has produced. Early media can
+// sit unread until the 200, and dropping the oldest would skip the start.
 func (j *jitter) enqueue(frame []byte) {
-	if len(j.out) == maxPlayout {
-		j.out[0] = nil
-		j.out = j.out[1:]
-	}
 	j.out = append(j.out, frame)
+}
+
+func (j *jitter) queued() int {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return len(j.out)
 }
 
 func (j *jitter) at(seq uint16) *slot {
