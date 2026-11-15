@@ -37,6 +37,7 @@ type Media struct {
 
 	interval time.Duration
 	cname    string
+	tones    *dtmfRecv
 
 	stop chan struct{}
 	kick chan struct{}
@@ -44,6 +45,9 @@ type Media struct {
 
 	mu         sync.Mutex
 	stopped    bool
+	digitDur   time.Duration
+	dtmfPT     int
+	dtmfFMTP   string
 	sdpRTP     *net.UDPAddr
 	sdpRTCP    *net.UDPAddr
 	byeCount   int
@@ -84,6 +88,10 @@ func StartMedia(ctx context.Context, pair *RTPPair, remote RemoteMedia) (*Media,
 	if err != nil {
 		return nil, err
 	}
+	digit := params.digit
+	if digit <= 0 {
+		digit = 160 * time.Millisecond
+	}
 	m := &Media{
 		pair:      pair,
 		ep:        pair.endpoint,
@@ -94,13 +102,17 @@ func StartMedia(ctx context.Context, pair *RTPPair, remote RemoteMedia) (*Media,
 		send:      snd,
 		recv:      &reception{},
 		play:      newJitter(params.jitter, Codec(remote.Audio.Name)),
+		tones:     newDTMFRecv(),
 		interval:  params.interval,
 		cname:     params.cname,
+		digitDur:  digit,
 		stop:      make(chan struct{}),
 		kick:      make(chan struct{}, 1),
 		sdpRTP:    cloneUDP(rtpAddr),
 		sdpRTCP:   cloneUDP(rtcpAddr),
 	}
+	m.send.setGap(gapTicks(params.gap))
+	m.bindDTMF(remote)
 	if err := m.sendOne(); err != nil {
 		return nil, err
 	}
@@ -152,6 +164,33 @@ func (m *Media) WritePCM(pcm []byte) error {
 	return m.send.writePCM(pcm)
 }
 
+// ReadDTMF returns one event per press. The first end bit for
+// (SSRC, timestamp, event) emits it. A new timestamp emits the previous
+// press when that press never set the end bit. Retransmitted end packets
+// do not emit again. A-D and flash are returned here. After Close it
+// returns ErrMediaClosed.
+func (m *Media) ReadDTMF() (DTMF, error) {
+	if m == nil || m.tones == nil {
+		return DTMF{}, ErrMediaClosed
+	}
+	return m.tones.read()
+}
+
+// WriteDTMF queues a telephone-event after PCM already waiting.
+// The event replaces audio for the press. The timestamp stays at the start.
+// Every 20 ms the sequence increments and the duration grows by 160.
+// Three end packets follow. Duration zero uses the configured digit duration.
+// A non-zero duration rounds up to 20 ms. ErrDTMFNotNegotiated sends nothing.
+func (m *Media) WriteDTMF(ev DTMF) error {
+	return m.queueDTMF(ev, false)
+}
+
+// WriteDTMFUrgent queues the event ahead of PCM so the next 20 ms tick sends it.
+// The packet shape matches WriteDTMF.
+func (m *Media) WriteDTMFUrgent(ev DTMF) error {
+	return m.queueDTMF(ev, true)
+}
+
 // UsePipeline attaches the resample edge. Clear runs with the jitter reset
 // when the remote address changes. A nil pipeline leaves PCM at 8000 Hz.
 func (m *Media) UsePipeline(p *Pipeline) error {
@@ -189,6 +228,7 @@ func (m *Media) Retarget(remote RemoteMedia) error {
 	}
 	m.play.setCodec(Codec(remote.Audio.Name))
 	m.rtpLatch.setPayloads(uint8(remote.Audio.Payload), eventPayload(remote.DTMF, remote.Audio.Payload))
+	m.bindDTMF(remote)
 	m.mu.Lock()
 	if m.stopped {
 		m.mu.Unlock()
@@ -275,6 +315,9 @@ func (m *Media) halt() {
 	m.stopped = true
 	m.mu.Unlock()
 	m.send.markClosed()
+	if m.tones != nil {
+		m.tones.shutdown()
+	}
 	close(m.stop)
 	_ = m.rtp.SetReadDeadline(time.Unix(1, 0))
 	_ = m.rtcp.SetReadDeadline(time.Unix(1, 0))
@@ -359,9 +402,29 @@ func (m *Media) ingest(acc rtpAccept, now time.Time) {
 			m.play.pushAudio(acc.ssrc, acc.seq, pcm, now)
 		}
 	} else {
+		// Telephone-event is not G.711. The sequence is consumed so the
+		// playout tick conceals that 20 ms instead of counting a loss.
 		m.play.pushEvent(acc.ssrc, acc.seq, now)
+		if m.tones != nil {
+			m.tones.observe(acc.ssrc, acc.ts, acc.payload)
+		}
 	}
 	m.recv.note(acc.ssrc, uint32(acc.seq), acc.ts, now, acc.audio)
+}
+
+func (m *Media) bindDTMF(remote RemoteMedia) {
+	pt := eventPayload(remote.DTMF, remote.Audio.Payload)
+	fmtp := "0-15"
+	if remote.DTMF != nil && remote.DTMF.FMTP != "" {
+		fmtp = remote.DTMF.FMTP
+	}
+	m.mu.Lock()
+	m.dtmfPT = pt
+	m.dtmfFMTP = fmtp
+	m.mu.Unlock()
+	if m.tones != nil {
+		m.tones.setSpec(pt >= 0, fmtp)
+	}
 }
 
 func (m *Media) playLoop() {
@@ -470,6 +533,8 @@ type mediaParams struct {
 	interval time.Duration
 	cname    string
 	jitter   JitterConfig
+	digit    time.Duration
+	gap      time.Duration
 }
 
 func (e *Endpoint) mediaParams() (mediaParams, error) {
@@ -492,6 +557,8 @@ func (e *Endpoint) mediaParams() (mediaParams, error) {
 		interval: interval,
 		cname:    e.cfg.User + "@" + e.cfg.Domain,
 		jitter:   e.cfg.Jitter,
+		digit:    e.cfg.DTMF.DigitDuration,
+		gap:      e.cfg.DTMF.InterDigitGap,
 	}, nil
 }
 

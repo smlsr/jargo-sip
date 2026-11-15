@@ -36,11 +36,21 @@ type sender struct {
 	lastTS       uint32
 	pt           uint8
 	codec        Codec
-	queue        []byte
+	items        []sendItem
+	run          *dtmfRun
+	gap          int
+	gapTicks     int
 	armSilence   bool
 	inSilence    bool
 	forceSilence bool
 	closed       bool
+}
+
+// sendItem is PCM waiting its turn, or one telephone-event press.
+// A press replaces audio. PCM queued ahead of a normal press is sent first.
+type sendItem struct {
+	pcm []byte
+	ev  *dtmfReq
 }
 
 func newSender(audio Format) (*sender, error) {
@@ -122,10 +132,60 @@ func (s *sender) writePCM(pcm []byte) error {
 	if s.closed {
 		return ErrMediaClosed
 	}
-	if len(s.queue)+len(pcm) > maxPCMQueue {
+	if s.pcmLen()+len(pcm) > maxPCMQueue {
 		return errors.New("pcm queue is full")
 	}
-	s.queue = append(s.queue, pcm...)
+	if n := len(s.items); n > 0 && s.items[n-1].ev == nil {
+		s.items[n-1].pcm = append(s.items[n-1].pcm, pcm...)
+		return nil
+	}
+	s.items = append(s.items, sendItem{pcm: append([]byte(nil), pcm...)})
+	return nil
+}
+
+func (s *sender) pcmLen() int {
+	n := 0
+	for _, it := range s.items {
+		n += len(it.pcm)
+	}
+	return n
+}
+
+func (s *sender) setGap(ticks int) {
+	s.mu.Lock()
+	s.gapTicks = ticks
+	s.mu.Unlock()
+}
+
+// enqueueDTMF schedules one press. Urgent is the next thing the ticker sends,
+// ahead of PCM already queued. A normal press waits until that PCM has gone out.
+// The press does not start until the current press and its inter-digit gap finish.
+func (s *sender) enqueueDTMF(req dtmfReq, urgent bool) error {
+	if req.packets < 1 || req.pt > 127 {
+		return errors.New("dtmf request is invalid")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrMediaClosed
+	}
+	n := 0
+	for _, it := range s.items {
+		if it.ev != nil {
+			n++
+		}
+	}
+	if n >= maxQueuedDTMF {
+		return errors.New("dtmf queue is full")
+	}
+	saved := req
+	item := sendItem{ev: &saved}
+	if urgent {
+		s.items = append([]sendItem{item}, s.items...)
+		s.gap = 0
+		return nil
+	}
+	s.items = append(s.items, item)
 	return nil
 }
 
@@ -148,42 +208,138 @@ func (s *sender) stats() SenderStats {
 }
 
 // packet builds the next 20 ms RTP packet. A late caller still gets one packet.
+// Telephone-event keeps the timestamp at the start of the press. Audio,
+// silence, and the inter-digit gap advance it by 160.
 func (s *sender) packet() ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return nil, ErrMediaClosed
 	}
-	payload, marker := s.payload()
+	if s.run != nil {
+		return s.dtmfPacket()
+	}
+	if s.gap > 0 {
+		raw, err := s.emitAudio(nil)
+		if err != nil {
+			return nil, err
+		}
+		s.gap--
+		return raw, nil
+	}
+	s.armDTMF()
+	if s.run != nil {
+		return s.dtmfPacket()
+	}
+	return s.emitAudio(s.takePCM())
+}
+
+func (s *sender) armDTMF() {
+	if len(s.items) == 0 || s.items[0].ev == nil {
+		return
+	}
+	req := s.items[0].ev
+	s.items = s.items[1:]
+	s.run = &dtmfRun{event: req.event, pt: req.pt, packets: req.packets, start: s.ts}
+}
+
+// dtmfPacket sends the next slice of the press. The timestamp stays at the
+// start. Duration grows by 160 until the press ends, then three end packets
+// repeat that duration. The following audio timestamp is the start plus the
+// final duration.
+func (s *sender) dtmfPacket() ([]byte, error) {
+	r := s.run
+	end := r.sent >= r.packets
+	samples := r.packets * frameSamples
+	if !end {
+		samples = (r.sent + 1) * frameSamples
+	}
+	payload := telephonePayload(r.event, end, dtmfVolume, uint16(samples))
+	raw, err := s.marshal(r.pt, r.sent == 0, r.start, payload)
+	if err != nil {
+		return nil, err
+	}
+	r.sent++
+	if r.sent >= r.packets+dtmfEndRepeats {
+		s.ts = r.start + uint32(r.packets*frameSamples)
+		s.run = nil
+		s.inSilence = true
+		s.armSilence = true
+		if s.gapTicks > 0 && len(s.items) > 0 && s.items[0].ev != nil {
+			s.gap = s.gapTicks
+		}
+	}
+	return raw, nil
+}
+
+func (s *sender) emitAudio(pcm []byte) ([]byte, error) {
+	payload, marker := s.payloadFrom(pcm)
+	raw, err := s.marshal(s.pt, marker, s.ts, payload)
+	if err != nil {
+		return nil, err
+	}
+	s.ts += frameSamples
+	return raw, nil
+}
+
+func (s *sender) marshal(pt uint8, marker bool, ts uint32, payload []byte) ([]byte, error) {
 	pkt := rtp.Packet{
 		Header: rtp.Header{
 			Version:        2,
 			Marker:         marker,
-			PayloadType:    s.pt,
+			PayloadType:    pt,
 			SequenceNumber: s.seq,
-			Timestamp:      s.ts,
+			Timestamp:      ts,
 			SSRC:           s.ssrc,
 		},
 		Payload: payload,
 	}
+	raw, err := pkt.Marshal()
+	if err != nil {
+		return nil, err
+	}
 	s.lastSeq = s.seq
-	s.lastTS = s.ts
+	s.lastTS = ts
 	s.seq++
-	s.ts += frameSamples
 	s.packets++
 	s.octets += uint32(len(payload))
-	return pkt.Marshal()
+	return raw, nil
 }
 
-func (s *sender) payload() ([]byte, bool) {
-	var pcm []byte
-	if !s.forceSilence && len(s.queue) >= frameBytes {
-		pcm = make([]byte, frameBytes)
-		copy(pcm, s.queue[:frameBytes])
-		rest := make([]byte, len(s.queue)-frameBytes)
-		copy(rest, s.queue[frameBytes:])
-		s.queue = rest
+// takePCM returns one 20 ms frame from PCM queued ahead of the next press.
+// A short tail stays queued. Hold does not consume it.
+func (s *sender) takePCM() []byte {
+	if s.forceSilence || s.pcmAhead() < frameBytes {
+		return nil
 	}
+	out := make([]byte, 0, frameBytes)
+	for len(out) < frameBytes && len(s.items) > 0 && s.items[0].ev == nil {
+		need := frameBytes - len(out)
+		head := s.items[0].pcm
+		if len(head) <= need {
+			out = append(out, head...)
+			s.items[0] = sendItem{}
+			s.items = s.items[1:]
+			continue
+		}
+		out = append(out, head[:need]...)
+		s.items[0].pcm = head[need:]
+	}
+	return out
+}
+
+func (s *sender) pcmAhead() int {
+	n := 0
+	for _, it := range s.items {
+		if it.ev != nil {
+			break
+		}
+		n += len(it.pcm)
+	}
+	return n
+}
+
+func (s *sender) payloadFrom(pcm []byte) ([]byte, bool) {
 	silence := pcm == nil
 	var out []byte
 	if silence {
@@ -207,6 +363,7 @@ func (s *sender) payload() ([]byte, bool) {
 	} else if s.inSilence {
 		marker = true
 		s.inSilence = false
+		s.armSilence = false
 	}
 	return out, marker
 }
