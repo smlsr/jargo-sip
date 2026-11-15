@@ -38,7 +38,10 @@
 // Digest challenges use github.com/icholy/digest v1.2.0 (2026-07-28).
 // Accept takes one established call. The first INVITE starts media when
 // the ACK arrives. re-INVITE and UPDATE commit a media change when the
-// 200 is sent. 100rel state stays on the dialog. Supported is 100rel.
+// 200 is sent. 100rel state stays on the dialog. Supported stays 100rel
+// on ordinary responses. The original INVITE and OPTIONS add timer when
+// SessionTimer is set. A non-nil Register sends REGISTER after the socket
+// is up. OPTIONS answers 200 and does not touch media.
 //
 // Dial sends one INVITE. A 401 or 407 is answered once. A 183 with SDP
 // starts early media. ACK and CANCEL copy the INVITE CSeq. Blind REFER

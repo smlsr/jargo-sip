@@ -262,8 +262,12 @@ func TestBehindSBCBindsLocal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(buf[:n]), "SIP/2.0 405") {
-		t.Fatalf("sip response %q", buf[:n])
+	text := string(buf[:n])
+	if !strings.Contains(text, "SIP/2.0 200") {
+		t.Fatalf("sip response %q", text)
+	}
+	if !strings.Contains(text, "Allow: "+allowMethods) || !strings.Contains(text, "Accept: application/sdp") {
+		t.Fatalf("options response %q", text)
 	}
 
 	tcp, err := net.DialTimeout("tcp", ep.sipTCP.Addr().String(), time.Second)

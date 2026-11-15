@@ -67,6 +67,15 @@ type Endpoint struct {
 	beforeFinal func(*dialog, *sip.Request)
 
 	onReplaced func(old, new *Call)
+
+	regMu     sync.Mutex
+	regCallID string
+	regCSeq   uint32
+	regFrom   sip.Header
+	regOK     bool
+	regStop   bool
+	regCancel context.CancelFunc
+	regSend   sync.Mutex
 }
 
 // New stores cfg. Start validates it and binds.
@@ -163,8 +172,8 @@ func (e *Endpoint) Start(ctx context.Context) error {
 	}
 
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	if e.closed {
+		e.mu.Unlock()
 		return errors.New("endpoint is closed")
 	}
 	e.cfg = ready.cfg
@@ -193,11 +202,33 @@ func (e *Endpoint) Start(ctx context.Context) error {
 		cancel()
 		e.root = nil
 		e.rootCancel = nil
+		e.mu.Unlock()
 		return err
+	}
+	needReg := e.cfg.Register != nil
+	if !needReg {
+		e.started = true
+		e.starting = false
+		owned = true
+		e.mu.Unlock()
+		return nil
+	}
+	e.mu.Unlock()
+
+	if err := e.registerInitial(ctx); err != nil {
+		e.abortStart()
+		return err
+	}
+	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		e.abortStart()
+		return errors.New("endpoint is closed")
 	}
 	e.started = true
 	e.starting = false
 	owned = true
+	e.mu.Unlock()
 	return nil
 }
 
@@ -220,12 +251,39 @@ func (e *Endpoint) Addresses() (Addresses, error) {
 // Media sessions on those pairs are stopped first.
 func (e *Endpoint) Close() error {
 	e.closeOnce.Do(func() {
+		e.unregister()
 		e.hangupAll()
 		e.closeErr = e.shutdown()
 		e.serveWG.Wait()
 		e.wakeAcceptClosed()
 	})
 	return e.closeErr
+}
+
+// abortStart tears down a socket that Start opened when the first REGISTER fails.
+func (e *Endpoint) abortStart() {
+	e.mu.Lock()
+	cancel := e.rootCancel
+	ua := e.sipUA
+	udp := e.sipUDP
+	tcp := e.sipTCP
+	e.sipUA = nil
+	e.sipCli = nil
+	e.root = nil
+	e.rootCancel = nil
+	e.sipUDP = nil
+	e.sipTCP = nil
+	e.started = false
+	e.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	// Close the socket before the user agent so ServeUDP can return.
+	_ = closeBind(udp, tcp)
+	if ua != nil {
+		_ = ua.Close()
+	}
+	e.serveWG.Wait()
 }
 
 func (e *Endpoint) shutdown() error {

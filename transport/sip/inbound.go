@@ -70,6 +70,7 @@ func (e *Endpoint) openSIP(advIP net.IP, advPort int, udp *net.UDPConn, tcp *net
 	srv.OnCancel(e.onCancel)
 	srv.OnRefer(e.onRefer)
 	srv.OnNotify(e.onNotify)
+	srv.OnOptions(e.onOptions)
 	e.serveWG.Add(1)
 	go func() {
 		defer e.serveWG.Done()
@@ -298,6 +299,11 @@ func (e *Endpoint) onNewInvite(req *sip.Request, tx sip.ServerTransaction) {
 	}
 	res := sip.NewResponseFromRequest(sess.InviteRequest, sip.StatusOK, phrase(sip.StatusOK), raw)
 	e.decorate(res, true)
+	if h := e.noteInboundSession(d, req); h != nil {
+		res.RemoveHeader("Supported")
+		res.AppendHeader(timerSupported())
+		res.AppendHeader(h)
+	}
 	if err := tx.Respond(res); err != nil {
 		return
 	}
@@ -333,6 +339,7 @@ func (e *Endpoint) onNewInvite(req *sip.Request, tx sip.ServerTransaction) {
 			_ = call.Hangup(context.Background())
 		})
 	}
+	d.armStoredSession()
 	if victim != nil {
 		e.completeReplace(victim, call)
 	}
@@ -435,6 +442,7 @@ func (e *Endpoint) onReinvite(req *sip.Request, tx sip.ServerTransaction) {
 		d.setAckPending(false)
 		return
 	}
+	d.rearmSession()
 	d.endInbound(offerInInvite, gen)
 	own = false
 	defer d.setAckPending(false)
@@ -476,6 +484,7 @@ func (e *Endpoint) onUpdate(req *sip.Request, tx sip.ServerTransaction) {
 		}
 		d.storeContact(req)
 		_ = e.respond(tx, req, sip.StatusOK, phrase(sip.StatusOK), nil)
+		d.rearmSession()
 		return
 	}
 	own := true
@@ -504,6 +513,7 @@ func (e *Endpoint) onUpdate(req *sip.Request, tx sip.ServerTransaction) {
 	if err := d.commitIfSent(remote, dir, raw, func() error { return tx.Respond(res) }); err != nil {
 		return
 	}
+	d.rearmSession()
 	d.endInbound(offerInUpdate, gen)
 	own = false
 }
@@ -517,6 +527,26 @@ func (e *Endpoint) glareRespond(tx sip.ServerTransaction, req *sip.Request, code
 		extra = append(extra, sip.NewHeader("Retry-After", strconv.Itoa(retry)))
 	}
 	_ = e.respond(tx, req, code, phrase(code), nil, extra...)
+}
+
+func (e *Endpoint) onOptions(req *sip.Request, tx sip.ServerTransaction) {
+	if e.isClosed() {
+		tx.Terminate()
+		return
+	}
+	if !inviteAllowed(req.Source(), e.cfg.AllowFrom) {
+		slog.Info("dropped OPTIONS", "source", req.Source(), "call_id", callIDOf(req))
+		tx.Terminate()
+		return
+	}
+	res := sip.NewResponseFromRequest(req, sip.StatusOK, phrase(sip.StatusOK), nil)
+	e.decorate(res, false)
+	if e.cfg.SessionTimer > 0 {
+		res.RemoveHeader("Supported")
+		res.AppendHeader(timerSupported())
+	}
+	res.AppendHeader(sip.NewHeader("Accept", "application/sdp"))
+	_ = tx.Respond(res)
 }
 
 func (e *Endpoint) onAck(req *sip.Request, tx sip.ServerTransaction) {

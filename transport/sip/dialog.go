@@ -111,6 +111,7 @@ func (c *Call) finish() {
 			c.max.Stop()
 		}
 		if c.dlg != nil {
+			c.dlg.stopSession()
 			c.dlg.stopInvite()
 			c.dlg.markEnded()
 			if c.dlg.pair != nil {
@@ -225,6 +226,13 @@ type dialog struct {
 	client       *sipgo.DialogClientSession
 	prackSeen    map[uint32]struct{}
 	notes        chan referNote
+
+	timerOffer       int
+	sessionInterval  time.Duration
+	sessionWeRefresh bool
+	sessionGen       uint64
+	sessionRefresh   *time.Timer
+	sessionExpiry    *time.Timer
 }
 
 func newDialog(ep *Endpoint, sess *sipgo.DialogServerSession) (*dialog, error) {
