@@ -23,6 +23,12 @@ jobs:
           # No module yet, so there is nothing to hash for the module cache.
           cache: false
 
+      - name: Install SIPp
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sip-tester libcap2-bin
+          sudo setcap cap_net_raw+ep "$(command -v sipp)"
+
       - name: Test
         shell: bash
         run: |

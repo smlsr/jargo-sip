@@ -33,6 +33,7 @@ Contract for `github.com/smlsr/jargo-sip`, package `transport/sip`. JAR-2 is doc
 | [options.md](options.md) | OPTIONS 200, not a media operation | JAR-8, JAR-11 |
 | [pipeline-adapter.md](pipeline-adapter.md) | `NewTransport`, native DTMF, BYE, resample edge | JAR-10 |
 | [custom-headers.md](custom-headers.md) | Read and set caller headers on every message | JAR-13 |
+| [sipp.md](sipp.md) | Live SIPp UAC and UAS checks | JAR-16 |
 
 ## Public functions
 
@@ -89,6 +90,8 @@ Each story is tested before the next. Acceptance tests in the plan are the defin
 11. JAR-13 custom headers on every message. Blocked on JAR-11.
 
 ## Shared acceptance
+
+The live SIPp run of the two SIPp lines is [sipp.md](sipp.md).
 
 - SIPp UAC: 5 s of PCMU, telephone-event 5 with three end packets, the digit once, `Done` closes. A run that never sets the end bit still returns 5 once when the next timestamp starts. Owner: JAR-7.
 - SIPp UAS: SDP `c=` is the local IP in `behind-sbc` and the advertise IP in `standalone`. Owner: JAR-3 and JAR-4.
