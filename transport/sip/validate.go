@@ -1,0 +1,163 @@
+package sip
+
+import (
+	"errors"
+	"fmt"
+	"net"
+	"strings"
+)
+
+var (
+	// ErrNATMode is returned when NATMode is not behind-sbc or standalone.
+	ErrNATMode = errors.New("NATMode must be behind-sbc or standalone")
+	// ErrSTUNBehindSBC is returned when behind-sbc is combined with STUN.
+	ErrSTUNBehindSBC = errors.New("STUN is refused when NATMode is behind-sbc")
+	// ErrPublicAdvertiseBehindSBC is returned when behind-sbc sets a public AdvertiseIP.
+	ErrPublicAdvertiseBehindSBC = errors.New("public AdvertiseIP is refused when NATMode is behind-sbc")
+	// ErrEmptyDomain is returned when Domain is empty.
+	ErrEmptyDomain = errors.New("domain is empty")
+	// ErrRTPRange is returned when the RTP range is odd, inverted, or cannot hold a pair.
+	ErrRTPRange = errors.New("RTP port range is odd or inverted")
+	// ErrAllowFromEmpty is returned when AllowFrom has no entry.
+	ErrAllowFromEmpty = errors.New("AllowFrom is empty")
+)
+
+type prepared struct {
+	cfg       Config
+	bindIP    net.IP
+	advertise net.IP // nil when AdvertiseIP is empty
+	stun      string
+	udp       bool
+	tcp       bool
+}
+
+func prepare(cfg Config) (prepared, error) {
+	cfg.ListenIP = strings.TrimSpace(cfg.ListenIP)
+	cfg.AdvertiseIP = strings.TrimSpace(cfg.AdvertiseIP)
+	cfg.STUNServer = strings.TrimSpace(cfg.STUNServer)
+	cfg.Domain = strings.TrimSpace(cfg.Domain)
+	cfg.User = strings.TrimSpace(cfg.User)
+	cfg.DisplayName = strings.TrimSpace(cfg.DisplayName)
+	cfg.PortMap = strings.TrimSpace(cfg.PortMap)
+
+	cfg = applyDefaults(cfg)
+
+	switch cfg.NATMode {
+	case NATBehindSBC, NATStandalone:
+	default:
+		return prepared{}, ErrNATMode
+	}
+	if cfg.Domain == "" {
+		return prepared{}, ErrEmptyDomain
+	}
+	allow := make([]string, 0, len(cfg.AllowFrom))
+	for _, src := range cfg.AllowFrom {
+		src = strings.TrimSpace(src)
+		if src != "" {
+			allow = append(allow, src)
+		}
+	}
+	if len(allow) == 0 {
+		return prepared{}, ErrAllowFromEmpty
+	}
+	cfg.AllowFrom = allow
+
+	if err := checkRTP(cfg.RTPPortMin, cfg.RTPPortMax); err != nil {
+		return prepared{}, err
+	}
+	if cfg.SIPPort < 1 || cfg.SIPPort > 65535 {
+		return prepared{}, fmt.Errorf("SIP port %d is out of range", cfg.SIPPort)
+	}
+
+	udp, tcp, transports, err := normalizeTransports(cfg.Transports)
+	if err != nil {
+		return prepared{}, err
+	}
+	cfg.Transports = transports
+
+	switch cfg.PortMap {
+	case PortMapIdentity, PortMapSTUN:
+	default:
+		return prepared{}, fmt.Errorf("PortMap %q is unknown", cfg.PortMap)
+	}
+
+	bindIP, err := parseListen(cfg.ListenIP)
+	if err != nil {
+		return prepared{}, err
+	}
+	advertise, err := parseAdvertise(cfg.AdvertiseIP)
+	if err != nil {
+		return prepared{}, err
+	}
+
+	if cfg.NATMode == NATBehindSBC {
+		if cfg.PortMap == PortMapSTUN || cfg.STUNServer != "" {
+			return prepared{}, ErrSTUNBehindSBC
+		}
+		if advertise != nil && isPublicIP(advertise) {
+			return prepared{}, ErrPublicAdvertiseBehindSBC
+		}
+		cfg.PortMap = PortMapIdentity
+	}
+
+	needsSTUN := cfg.NATMode == NATStandalone && (advertise == nil || cfg.PortMap == PortMapSTUN)
+	if needsSTUN {
+		if !udp {
+			return prepared{}, errors.New("STUN requires a UDP listen socket")
+		}
+		if cfg.STUNServer == "" {
+			return prepared{}, errors.New("STUNServer is required")
+		}
+	}
+
+	return prepared{
+		cfg:       cfg,
+		bindIP:    cloneIP(bindIP),
+		advertise: cloneIP(advertise),
+		stun:      cfg.STUNServer,
+		udp:       udp,
+		tcp:       tcp,
+	}, nil
+}
+
+func checkRTP(min, max int) error {
+	if min < 1 || max > 65535 || min > max {
+		return fmt.Errorf("%w (%d-%d)", ErrRTPRange, min, max)
+	}
+	if min%2 != 0 || max%2 != 0 {
+		return fmt.Errorf("%w (%d-%d)", ErrRTPRange, min, max)
+	}
+	// An even RTP port and its RTCP port (RTP+1) both have to fit.
+	if min+1 > max {
+		return fmt.Errorf("%w (%d-%d)", ErrRTPRange, min, max)
+	}
+	return nil
+}
+
+func normalizeTransports(in []string) (udp, tcp bool, out []string, err error) {
+	if len(in) == 0 {
+		in = []string{"udp"}
+	}
+	seen := map[string]bool{}
+	for _, raw := range in {
+		name := strings.ToLower(strings.TrimSpace(raw))
+		switch name {
+		case "udp":
+			udp = true
+		case "tcp":
+			tcp = true
+		case "tls":
+			return false, false, nil, errors.New("tls needs a certificate")
+		default:
+			return false, false, nil, fmt.Errorf("transport %q is unknown", raw)
+		}
+		if !seen[name] {
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	if !udp && !tcp {
+		return false, false, nil, errors.New("no SIP transport is configured")
+	}
+	return udp, tcp, out, nil
+}
