@@ -38,8 +38,12 @@ type jitter struct {
 	windowAt  time.Time
 	below     bool
 	missed    bool
-	seq       seqState
-	closed    bool
+	// hold is set when an underrun raises target. The next pull waits until
+	// that much real audio is buffered, or the next packet is older than it.
+	hold   bool
+	seq    seqState
+	far    []farPkt
+	closed bool
 }
 
 type slot struct {
@@ -48,7 +52,29 @@ type slot struct {
 	seq      uint16
 	samples  int
 	pcm      []byte
+	at       time.Time
 }
+
+// farPkt is one packet outside the ring. One such jump is ignored. A second
+// packet in the same range adopts the range.
+type farPkt struct {
+	ssrc    uint32
+	seq     uint16
+	samples int
+	event   bool
+	pcm     []byte
+	at      time.Time
+}
+
+const farAdopt = 2
+
+type pullKind uint8
+
+const (
+	pullNone pullKind = iota
+	pullFrame
+	pullGap
+)
 
 type seqState struct {
 	have     bool
@@ -106,7 +132,9 @@ func (j *jitter) reset() bool {
 	j.windowAt = time.Time{}
 	j.below = false
 	j.missed = false
+	j.hold = false
 	j.seq = seqState{}
+	j.far = nil
 	j.cond.Broadcast()
 	return had
 }
@@ -125,33 +153,16 @@ func (j *jitter) pushAudio(ssrc uint32, seq uint16, pcm []byte, at time.Time) {
 	if samples != frameSamples && samples != frameSamples/2 {
 		return
 	}
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	if j.closed {
-		return
-	}
-	// A packet already played is loss-accounted and dropped. A sequence past
-	// the ring is ignored so one jump cannot mark the whole window lost.
-	if j.started && seqLess(seq, j.head) {
-		j.seq.note(ssrc, seq)
-		return
-	}
-	if !j.place(seq) {
-		return
-	}
-	j.seq.note(ssrc, seq)
-	j.slots[int(seq)&(jitterRing-1)] = slot{
-		occupied: true,
-		seq:      seq,
-		samples:  samples,
-		pcm:      append([]byte(nil), pcm...),
-	}
-	j.track(seq, at)
+	j.push(ssrc, seq, pcm, samples, false, at)
 }
 
 // pushEvent consumes a telephone-event sequence. It is not loss. The playout
 // tick repeats the previous audio frame for that 20 ms and does not underrun.
 func (j *jitter) pushEvent(ssrc uint32, seq uint16, at time.Time) {
+	j.push(ssrc, seq, nil, 0, true, at)
+}
+
+func (j *jitter) push(ssrc uint32, seq uint16, pcm []byte, samples int, event bool, at time.Time) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if j.closed {
@@ -161,11 +172,16 @@ func (j *jitter) pushEvent(ssrc uint32, seq uint16, at time.Time) {
 		j.seq.note(ssrc, seq)
 		return
 	}
+	if j.have && j.aheadOfRing(seq) {
+		j.noteFar(ssrc, seq, pcm, samples, event, at)
+		return
+	}
 	if !j.place(seq) {
 		return
 	}
+	j.abandonFar()
 	j.seq.note(ssrc, seq)
-	j.slots[int(seq)&(jitterRing-1)] = slot{occupied: true, event: true, seq: seq}
+	j.store(seq, pcm, samples, event, at)
 	j.track(seq, at)
 }
 
@@ -224,11 +240,22 @@ func (j *jitter) emit(now time.Time) ([]byte, bool) {
 		j.below = false
 		j.missed = false
 	}
-	frame, gap := j.pull()
-	if gap {
+	// After an underrun the new target is how long the head waits. Do not
+	// pull again until that much audio is in front of it.
+	if j.hold && !j.rebuilt(now) {
+		return nil, false
+	}
+	frame, kind := j.pull()
+	if kind == pullNone {
+		return nil, false
+	}
+	if kind == pullGap {
 		j.underruns++
 		j.missed = true
 		j.raise()
+		j.hold = true
+	} else {
+		j.hold = false
 	}
 	j.adapt(now)
 	return frame, true
@@ -243,40 +270,90 @@ func (j *jitter) primed(now time.Time) bool {
 	return !j.oldestAt.IsZero() && now.Sub(j.oldestAt) > j.target
 }
 
+// buffered is the audio actually stored from the oldest packet through the
+// newest. A hole adds nothing. 160 samples are 20 ms and 80 samples are 10 ms.
 func (j *jitter) buffered() time.Duration {
 	if !j.have {
 		return 0
 	}
-	n := int(j.newest-j.oldest) + 1
-	if n < 1 {
-		return 0
-	}
-	return time.Duration(n) * tickInterval
+	return j.audioFrom(j.oldest, j.newest)
 }
 
+// depth is unplayed audio in front of the head, counted the same way.
 func (j *jitter) depth() time.Duration {
 	if !j.started || !j.have || seqLess(j.newest, j.head) {
 		return 0
 	}
-	return time.Duration(int(j.newest-j.head)+1) * tickInterval
+	return j.audioFrom(j.head, j.newest)
 }
 
-func (j *jitter) pull() ([]byte, bool) {
+// rebuilt reports whether the wait after a raised target is over.
+func (j *jitter) rebuilt(now time.Time) bool {
+	if j.depth() >= j.target {
+		return true
+	}
+	at, ok := j.nextAt()
+	return ok && now.Sub(at) > j.target
+}
+
+func (j *jitter) audioFrom(from, until uint16) time.Duration {
+	if seqLess(until, from) {
+		return 0
+	}
+	dist := int(until - from)
+	if dist > jitterRing {
+		dist = jitterRing
+	}
+	var samples int
+	for i := 0; i <= dist; i++ {
+		s := j.at(from + uint16(i))
+		if s == nil || s.event {
+			continue
+		}
+		samples += s.samples
+	}
+	return time.Duration(samples) * time.Second / wireClock
+}
+
+func (j *jitter) nextAt() (time.Time, bool) {
+	if !j.have || seqLess(j.newest, j.head) {
+		return time.Time{}, false
+	}
+	dist := int(j.newest - j.head)
+	if dist > jitterRing {
+		dist = jitterRing
+	}
+	for i := 0; i <= dist; i++ {
+		s := j.at(j.head + uint16(i))
+		if s != nil {
+			return s.at, true
+		}
+	}
+	return time.Time{}, false
+}
+
+func (j *jitter) pull() ([]byte, pullKind) {
 	s := j.at(j.head)
 	if s == nil {
+		// Nothing was received at head. A newer packet already in the ring is
+		// one hole and conceals once. An empty slot past newest is not a gap:
+		// leave head where it is so the next real packet is not late.
+		if !seqLess(j.head, j.newest) {
+			return nil, pullNone
+		}
 		j.head++
-		return j.conceal(), true
+		return j.conceal(), pullGap
 	}
 	if s.event {
 		j.drop(j.head)
 		j.head++
-		return j.conceal(), false
+		return j.conceal(), pullFrame
 	}
 	if s.samples == frameSamples {
 		frame := j.keep(s.pcm)
 		j.drop(j.head)
 		j.head++
-		return frame, false
+		return frame, pullFrame
 	}
 	next := j.at(j.head + 1)
 	if next != nil && !next.event && next.samples == frameSamples/2 {
@@ -284,12 +361,12 @@ func (j *jitter) pull() ([]byte, bool) {
 		j.drop(j.head)
 		j.drop(j.head + 1)
 		j.head += 2
-		return frame, false
+		return frame, pullFrame
 	}
 	frame := j.keep(joinPCM(s.pcm, s.pcm))
 	j.drop(j.head)
 	j.head++
-	return frame, true
+	return frame, pullGap
 }
 
 func (j *jitter) conceal() []byte {
@@ -363,6 +440,100 @@ func (j *jitter) drop(seq uint16) {
 	}
 }
 
+func (j *jitter) store(seq uint16, pcm []byte, samples int, event bool, at time.Time) {
+	j.slots[int(seq)&(jitterRing-1)] = slot{
+		occupied: true,
+		event:    event,
+		seq:      seq,
+		samples:  samples,
+		pcm:      append([]byte(nil), pcm...),
+		at:       at,
+	}
+}
+
+// aheadOfRing reports a sequence the ring cannot hold in front of the head.
+func (j *jitter) aheadOfRing(seq uint16) bool {
+	anchor := j.oldest
+	if j.started {
+		anchor = j.head
+	}
+	if seqLess(seq, anchor) || seq == anchor {
+		return false
+	}
+	return uint16(seq-anchor) >= jitterRing
+}
+
+// noteFar keeps a jump outside the ring. One packet is a stray and is not
+// played. A second packet in that range moves the head and the loss base.
+func (j *jitter) noteFar(ssrc uint32, seq uint16, pcm []byte, samples int, event bool, at time.Time) {
+	if len(j.far) > 0 && !farSpan(j.far, seq) {
+		j.far = nil
+	}
+	for i := range j.far {
+		if j.far[i].seq == seq {
+			j.far[i] = farPkt{ssrc: ssrc, seq: seq, samples: samples, event: event, pcm: append([]byte(nil), pcm...), at: at}
+			return
+		}
+	}
+	j.far = append(j.far, farPkt{ssrc: ssrc, seq: seq, samples: samples, event: event, pcm: append([]byte(nil), pcm...), at: at})
+	if len(j.far) >= farAdopt {
+		j.adoptFar()
+	}
+}
+
+func farSpan(pkts []farPkt, seq uint16) bool {
+	base, newest := pkts[0].seq, pkts[0].seq
+	for _, p := range pkts[1:] {
+		if seqLess(p.seq, base) {
+			base = p.seq
+		}
+		if seqLess(newest, p.seq) {
+			newest = p.seq
+		}
+	}
+	if seqLess(seq, base) {
+		base = seq
+	}
+	if seqLess(newest, seq) {
+		newest = seq
+	}
+	return uint16(newest-base) < jitterRing
+}
+
+func (j *jitter) abandonFar() {
+	j.far = nil
+}
+
+func (j *jitter) adoptFar() {
+	if len(j.far) < farAdopt {
+		return
+	}
+	for i := range j.slots {
+		j.slots[i] = slot{}
+	}
+	base, newest := j.far[0].seq, j.far[0].seq
+	at := j.far[0].at
+	ssrc := j.far[0].ssrc
+	for _, p := range j.far {
+		if seqLess(p.seq, base) {
+			base = p.seq
+			at = p.at
+		}
+		if seqLess(newest, p.seq) {
+			newest = p.seq
+		}
+		j.store(p.seq, p.pcm, p.samples, p.event, p.at)
+	}
+	j.have = true
+	j.oldest = base
+	j.newest = newest
+	j.head = base
+	j.oldestAt = at
+	j.hold = false
+	j.seq.rebase(ssrc, base, newest, uint32(len(j.far)))
+	j.far = nil
+}
+
 func (j *jitter) place(seq uint16) bool {
 	if !j.have {
 		return true
@@ -423,6 +594,10 @@ func (j *jitter) running() bool {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	return j.started
+}
+
+func (st *seqState) rebase(ssrc uint32, base, max uint16, got uint32) {
+	*st = seqState{have: true, ssrc: ssrc, base: base, max: max, got: got}
 }
 
 func (st *seqState) note(ssrc uint32, seq uint16) {

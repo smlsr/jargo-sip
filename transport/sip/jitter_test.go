@@ -81,7 +81,10 @@ func TestDroppedPacketIsOneConcealment(t *testing.T) {
 	f1, ok := j.step(now)
 	f2, ok2 := j.step(now.Add(tickInterval))
 	conceal, ok3 := j.step(now.Add(2 * tickInterval))
-	f4, ok4 := j.step(now.Add(3 * tickInterval))
+	if _, waited := j.step(now.Add(3 * tickInterval)); waited {
+		t.Fatal("playout did not wait for the raised target")
+	}
+	f4, ok4 := j.step(now.Add(60*time.Millisecond + time.Nanosecond))
 	if !ok || !ok2 || !ok3 || !ok4 {
 		t.Fatal("a tick did not produce a frame")
 	}
@@ -202,6 +205,156 @@ func TestTenMillisecondFramesCombine(t *testing.T) {
 	}
 	if j.underrunCount() != 0 {
 		t.Fatalf("underruns %d", j.underrunCount())
+	}
+}
+
+func TestDrainDoesNotRunAhead(t *testing.T) {
+	j := testJitter(40*time.Millisecond, 20*time.Millisecond, 200*time.Millisecond)
+	now := time.Unix(1, 0)
+	a := pcmTone(1)
+	b := pcmTone(2)
+	c := pcmTone(3)
+	d := pcmTone(4)
+	j.pushAudio(7, 1, a, now)
+	j.pushAudio(7, 2, b, now)
+	f1, ok1 := j.step(now)
+	f2, ok2 := j.step(now.Add(tickInterval))
+	if !ok1 || !ok2 || !bytes.Equal(f1, a) || !bytes.Equal(f2, b) {
+		t.Fatal("did not play seq 1 and 2")
+	}
+	if _, ok := j.step(now.Add(2 * tickInterval)); ok {
+		t.Fatal("empty tick past newest moved the head")
+	}
+	if _, ok := j.step(now.Add(3 * tickInterval)); ok {
+		t.Fatal("second empty tick concealed")
+	}
+	if j.underrunCount() != 0 || j.delay() != 40*time.Millisecond {
+		t.Fatalf("underruns %d target %s", j.underrunCount(), j.delay())
+	}
+	j.pushAudio(7, 3, c, now.Add(4*tickInterval))
+	j.pushAudio(7, 4, d, now.Add(4*tickInterval))
+	f3, ok3 := j.step(now.Add(4 * tickInterval))
+	f4, ok4 := j.step(now.Add(5 * tickInterval))
+	if !ok3 || !ok4 || !bytes.Equal(f3, c) || !bytes.Equal(f4, d) {
+		t.Fatal("packets after the drain were treated as late")
+	}
+	if j.underrunCount() != 0 || j.delay() != 40*time.Millisecond {
+		t.Fatalf("after drain underruns %d target %s", j.underrunCount(), j.delay())
+	}
+}
+
+func TestDurationCountsStoredSamples(t *testing.T) {
+	j := testJitter(60*time.Millisecond, 20*time.Millisecond, 200*time.Millisecond)
+	now := time.Unix(1, 0)
+	j.pushAudio(7, 1, pcmTone(1), now)
+	j.pushAudio(7, 3, pcmTone(3), now)
+	if _, ok := j.step(now); ok {
+		t.Fatal("target 60 ms started on 40 ms of audio plus a hole")
+	}
+
+	short := testJitter(40*time.Millisecond, 20*time.Millisecond, 200*time.Millisecond)
+	half := bytes.Repeat([]byte{1, 2}, 80)
+	short.pushAudio(7, 1, half, now)
+	short.pushAudio(7, 2, bytes.Repeat([]byte{3, 4}, 80), now)
+	if _, ok := short.step(now); ok {
+		t.Fatal("target 40 ms started on 20 ms of 10 ms packets")
+	}
+
+	// Four 10 ms packets are 40 ms. Counting each sequence as 20 ms would sit
+	// above Target+20 ms and lower the target. Real audio does not.
+	pace := testJitter(40*time.Millisecond, 20*time.Millisecond, 200*time.Millisecond)
+	var seq uint16 = 1
+	for n := 0; n < 4; n++ {
+		pace.pushAudio(7, seq, half, now)
+		seq++
+	}
+	for n := 0; n < 130; n++ {
+		pace.pushAudio(7, seq, half, now)
+		seq++
+		pace.pushAudio(7, seq, half, now)
+		seq++
+		if _, ok := pace.step(now); !ok {
+			t.Fatalf("10 ms playout stopped at %s", now.Sub(time.Unix(1, 0)))
+		}
+		if pace.underrunCount() != 0 {
+			t.Fatalf("underrun %d", pace.underrunCount())
+		}
+		now = now.Add(tickInterval)
+	}
+	if pace.delay() != 40*time.Millisecond {
+		t.Fatalf("target lowered to %s on inflated depth", pace.delay())
+	}
+}
+
+func TestFarRunIsAdopted(t *testing.T) {
+	j := testJitter(40*time.Millisecond, 20*time.Millisecond, 200*time.Millisecond)
+	now := time.Unix(1, 0)
+	j.pushAudio(7, 1, pcmTone(1), now)
+	j.pushAudio(7, 2, pcmTone(2), now)
+	if _, ok := j.step(now); !ok {
+		t.Fatal("did not start")
+	}
+	if _, ok := j.step(now); !ok {
+		t.Fatal("did not play seq 2")
+	}
+	j.pushAudio(7, 300, pcmTone(9), now)
+	if _, ok := j.step(now); ok {
+		t.Fatal("one stray jump was played")
+	}
+	j.pushAudio(7, 3, pcmTone(3), now)
+	frame, ok := j.step(now)
+	if !ok || !bytes.Equal(frame, pcmTone(3)) {
+		t.Fatal("stray jump stole the head from seq 3")
+	}
+	loss, have := j.loss()
+	if !have || loss.total != 0 || loss.ext != 3 {
+		t.Fatalf("stray changed loss %+v", loss)
+	}
+
+	run := testJitter(40*time.Millisecond, 20*time.Millisecond, 200*time.Millisecond)
+	run.pushAudio(7, 1, pcmTone(1), now)
+	run.pushAudio(7, 2, pcmTone(2), now)
+	if _, ok := run.step(now); !ok {
+		t.Fatal("run did not start")
+	}
+	if _, ok := run.step(now); !ok {
+		t.Fatal("run did not play seq 2")
+	}
+	var got []byte
+	for seq := uint16(202); seq <= 206; seq++ {
+		tone := pcmTone(byte(seq))
+		run.pushAudio(7, seq, tone, now)
+		frame, ok := run.step(now)
+		now = now.Add(tickInterval)
+		if !ok {
+			continue
+		}
+		if bytes.Equal(frame, pcmTone(2)) {
+			t.Fatalf("seq %d tick concealed seq 2", seq)
+		}
+		got = append(got, frame[0])
+	}
+	for {
+		frame, ok := run.step(now)
+		if !ok {
+			break
+		}
+		got = append(got, frame[0])
+		now = now.Add(tickInterval)
+		if len(got) > 8 {
+			t.Fatal("playout did not stop")
+		}
+	}
+	want := []byte{pcmTone(202)[0], pcmTone(203)[0], pcmTone(204)[0], pcmTone(205)[0], pcmTone(206)[0]}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("played %v", got)
+	}
+	if run.underrunCount() != 0 {
+		t.Fatalf("underruns %d", run.underrunCount())
+	}
+	loss, have = run.loss()
+	if !have || loss.total != 0 || loss.ext != 206 {
+		t.Fatalf("loss base did not move %+v", loss)
 	}
 }
 
