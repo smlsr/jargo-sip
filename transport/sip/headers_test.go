@@ -2,8 +2,10 @@ package sip
 
 import (
 	"context"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -447,4 +449,81 @@ func TestInboundPrackHeaders(t *testing.T) {
 	wantCall(t, call, "x-in", "invite")
 	wantCall(t, call, "X-Prack", "in")
 	_ = call.Hangup(context.Background())
+}
+
+func mapEntries(m *sync.Map) int {
+	n := 0
+	m.Range(func(_, _ any) bool {
+		n++
+		return true
+	})
+	return n
+}
+
+func waitDialogHeaderEntries(t *testing.T, want int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		runtime.GC()
+		if got := mapEntries(&dialogHeaders); got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("dialog header entries = %d, want %d", mapEntries(&dialogHeaders), want)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func answeredCall(t *testing.T, ep *Endpoint, value string) *Call {
+	t.Helper()
+	u := newUAS(t)
+	go func() {
+		inv := u.waitMethod("INVITE", 2*time.Second)
+		u.respond(inv, 200, "OK", earlyBodyString(u.rtpPort(), true), map[string]string{"X-Peer": value})
+		_ = u.waitMethod("ACK", 2*time.Second)
+		_ = u.waitMethod("BYE", 2*time.Second)
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	call, err := ep.Dial(ctx, u.uri(), Header{Name: "X-Trace", Value: value})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return call
+}
+
+func TestFinishedCallsDoNotLeaveHeaderEntries(t *testing.T) {
+	waitDialogHeaderEntries(t, 0)
+	ep := startEP(t, baseConfig())
+	ep.SetHeader("X-Opt", "ep")
+	if mapEntries(&endpointHeaders) != 1 {
+		t.Fatalf("endpoint entries %d", mapEntries(&endpointHeaders))
+	}
+	first := answeredCall(t, ep, "one")
+	second := answeredCall(t, ep, "two")
+	if got := mapEntries(&dialogHeaders); got != 2 {
+		t.Fatalf("live calls left %d dialog entries", got)
+	}
+	if err := first.Hangup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Hangup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	wantCall(t, first, "x-peer", "one")
+	wantCall(t, second, "x-peer", "two")
+	if got := mapEntries(&dialogHeaders); got != 2 {
+		t.Fatalf("held calls left %d dialog entries", got)
+	}
+	runtime.KeepAlive(first)
+	runtime.KeepAlive(second)
+	first = nil
+	second = nil
+	waitDialogHeaderEntries(t, 0)
+
+	ep.Close()
+	if got := mapEntries(&endpointHeaders); got != 0 {
+		t.Fatalf("closed endpoint left %d entries", got)
+	}
 }

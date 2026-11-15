@@ -79,7 +79,6 @@ func (e *Endpoint) dial(ctx context.Context, rawURI, replaces string, progress f
 		if d.id != "" {
 			e.dialogs.drop(d.id)
 		}
-		releaseDialogHeaders(d)
 		_ = pair.Close()
 	}()
 

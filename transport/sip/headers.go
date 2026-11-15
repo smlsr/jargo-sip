@@ -1,8 +1,10 @@
 package sip
 
 import (
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/emiago/sipgo/sip"
 )
@@ -22,40 +24,71 @@ type headerState struct {
 	received [][]Header
 }
 
+// dialogHeaders and endpointHeaders count live owners. They store an id,
+// not the dialog, the endpoint, or the header bytes. Header bytes live on
+// dialog.headers and Endpoint.headers. A dropped Call lets the dialog be
+// collected, and that removes its id. Close removes the endpoint id.
 var (
-	dialogHeaders   sync.Map // *dialog -> *headerState
-	endpointHeaders sync.Map // *Endpoint -> *headerState
+	headerEntrySeq  atomic.Uint64
+	dialogHeaders   sync.Map // uint64 -> struct{}
+	endpointHeaders sync.Map // uint64 -> struct{}
 )
 
 func dialogState(d *dialog) *headerState {
 	if d == nil {
 		return &headerState{}
 	}
-	if v, ok := dialogHeaders.Load(d); ok {
-		return v.(*headerState)
-	}
-	st := &headerState{}
-	actual, _ := dialogHeaders.LoadOrStore(d, st)
-	return actual.(*headerState)
+	d.trackHeaders()
+	return &d.headers
+}
+
+func (d *dialog) trackHeaders() {
+	d.headerOnce.Do(func() {
+		id := headerEntrySeq.Add(1)
+		d.headerID = id
+		dialogHeaders.Store(id, struct{}{})
+		runtime.AddCleanup(d, func(id uint64) {
+			dialogHeaders.Delete(id)
+		}, id)
+	})
 }
 
 func endpointState(e *Endpoint) *headerState {
 	if e == nil {
 		return &headerState{}
 	}
-	if v, ok := endpointHeaders.Load(e); ok {
-		return v.(*headerState)
-	}
-	st := &headerState{}
-	actual, _ := endpointHeaders.LoadOrStore(e, st)
-	return actual.(*headerState)
+	e.trackHeaders()
+	return &e.headers
 }
 
-func releaseDialogHeaders(d *dialog) {
-	if d == nil {
+func (e *Endpoint) trackHeaders() {
+	e.headerOnce.Do(func() {
+		id := headerEntrySeq.Add(1)
+		e.headerID = id
+		endpointHeaders.Store(id, struct{}{})
+		runtime.AddCleanup(e, func(id uint64) {
+			endpointHeaders.Delete(id)
+		}, id)
+	})
+}
+
+// releaseHeaders drops the endpoint's header bytes and its map id. Close
+// calls this after the final BYE, while the Endpoint value may still be held.
+func (e *Endpoint) releaseHeaders() {
+	if e == nil {
 		return
 	}
-	dialogHeaders.Delete(d)
+	e.headers.clear()
+	if e.headerID != 0 {
+		endpointHeaders.Delete(e.headerID)
+	}
+}
+
+func (st *headerState) clear() {
+	st.mu.Lock()
+	st.out = nil
+	st.received = nil
+	st.mu.Unlock()
 }
 
 // ownedHeader is a hop-by-hop header this stack writes. A caller value

@@ -233,6 +233,10 @@ type dialog struct {
 	sessionGen       uint64
 	sessionRefresh   *time.Timer
 	sessionExpiry    *time.Timer
+
+	headers    headerState
+	headerOnce sync.Once
+	headerID   uint64
 }
 
 func newDialog(ep *Endpoint, sess *sipgo.DialogServerSession) (*dialog, error) {
