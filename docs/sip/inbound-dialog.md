@@ -29,4 +29,4 @@ The JAR acceptance "401 answered with digest exactly once" is the outbound side 
 
 ## Headers on the dialog
 
-We store Call-ID, local tag, remote tag, and the peer Contact as `Party.RemoteTarget`. CSeq on requests we send later is one more than the last CSeq on that dialog. re-INVITE uses the same Call-ID and tags ([reinvite.md](reinvite.md)).
+We store Call-ID, local tag, remote tag, and the peer Contact as `Party.RemoteTarget`. CSeq is per direction. A request we send is one higher than the last request we sent. A request we receive updates only the remote sequence. ACK and CANCEL copy the INVITE CSeq and do not increment. re-INVITE uses the same Call-ID and tags ([reinvite.md](reinvite.md)).
