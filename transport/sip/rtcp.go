@@ -100,12 +100,12 @@ func (m *Media) writeReport(bye, kicked bool) {
 			PacketCount: stats.Packets,
 			OctetCount:  stats.Octets,
 		}
-		if rep, ok := m.recv.report(now); ok {
+		if rep, ok := m.reportBlock(now); ok {
 			sr.Reports = []rtcp.ReceptionReport{rep}
 		}
 		pkts = append(pkts, sr)
 		m.rememberSR(uint32(ntp>>16), now)
-	} else if rep, ok := m.recv.report(now); ok {
+	} else if rep, ok := m.reportBlock(now); ok {
 		pkts = append(pkts, &rtcp.ReceiverReport{
 			SSRC:    stats.SSRC,
 			Reports: []rtcp.ReceptionReport{rep},
@@ -132,6 +132,25 @@ func (m *Media) writeReport(bye, kicked bool) {
 	m.mu.Lock()
 	m.lastReport = now
 	m.mu.Unlock()
+}
+
+// reportBlock is one receiver report. Fraction lost and the cumulative
+// count come from the jitter buffer. The interarrival jitter, LSR, and
+// DLSR stay on the reception clock. RTT is not applied to the playout target.
+func (m *Media) reportBlock(now time.Time) (rtcp.ReceptionReport, bool) {
+	rep, ok := m.recv.report(now)
+	if !ok {
+		return rtcp.ReceptionReport{}, false
+	}
+	loss, have := m.play.loss()
+	if !have {
+		return rep, true
+	}
+	rep.SSRC = loss.ssrc
+	rep.FractionLost = loss.frac
+	rep.TotalLost = loss.total
+	rep.LastSequenceNumber = loss.ext
+	return rep, true
 }
 
 func (m *Media) reportedRecently() bool {

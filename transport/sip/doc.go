@@ -21,5 +21,10 @@
 // (2026-11-12, 7d0492d2c0febfaa0c140007317992f84c8c1be9). Codec silence on
 // the wire is µ-law 0xFF or A-law 0xD5.
 //
-// Dialogs, the jitter buffer, and DTMF are not part of this package yet.
+// ReadPCM plays one 20 ms frame from a sequence ring. The head waits until
+// Target of audio is buffered, or the oldest packet is older than Target.
+// A missing packet repeats the previous frame. Pipeline rates other than
+// 8000 build one audio/resample stream per direction; 8000 does not.
+//
+// Dialogs and DTMF are not part of this package yet.
 package sip

@@ -32,6 +32,8 @@ type Media struct {
 	rtcpLatch *rtcpLatch
 	send      *sender
 	recv      *reception
+	play      *jitter
+	pipe      *Pipeline
 
 	interval time.Duration
 	cname    string
@@ -91,6 +93,7 @@ func StartMedia(ctx context.Context, pair *RTPPair, remote RemoteMedia) (*Media,
 		rtcpLatch: newRTCPLatch(params.match, params.allow, rtcpAddr),
 		send:      snd,
 		recv:      &reception{},
+		play:      newJitter(params.jitter, Codec(remote.Audio.Name)),
 		interval:  params.interval,
 		cname:     params.cname,
 		stop:      make(chan struct{}),
@@ -101,8 +104,9 @@ func StartMedia(ctx context.Context, pair *RTPPair, remote RemoteMedia) (*Media,
 	if err := m.sendOne(); err != nil {
 		return nil, err
 	}
-	m.wg.Add(5)
+	m.wg.Add(6)
 	go m.sendLoop()
+	go m.playLoop()
 	go m.readRTP()
 	go m.readRTCP()
 	go m.rtcpLoop()
@@ -130,12 +134,34 @@ func (m *Media) Close() error {
 	return nil
 }
 
+// ReadPCM returns one 20 ms frame of 8000 Hz 16-bit little-endian PCM.
+// It blocks until that frame is due. A gap returns the previous frame and a
+// nil error. After Close it returns ErrMediaClosed.
+func (m *Media) ReadPCM() ([]byte, error) {
+	if m == nil || m.play == nil {
+		return nil, ErrMediaClosed
+	}
+	return m.play.read()
+}
+
 // WritePCM queues 8000 Hz 16-bit little-endian PCM. The sender pulls 20 ms.
 func (m *Media) WritePCM(pcm []byte) error {
 	if err := m.alive(); err != nil {
 		return err
 	}
 	return m.send.writePCM(pcm)
+}
+
+// UsePipeline attaches the resample edge. Clear runs with the jitter reset
+// when the remote address changes. A nil pipeline leaves PCM at 8000 Hz.
+func (m *Media) UsePipeline(p *Pipeline) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.stopped {
+		return ErrMediaClosed
+	}
+	m.pipe = p
+	return nil
 }
 
 // SetDirection forces codec silence for sendonly, recvonly, and inactive.
@@ -161,6 +187,7 @@ func (m *Media) Retarget(remote RemoteMedia) error {
 	if err := m.send.setCodec(remote.Audio); err != nil {
 		return err
 	}
+	m.play.setCodec(Codec(remote.Audio.Name))
 	m.rtpLatch.setPayloads(uint8(remote.Audio.Payload), eventPayload(remote.DTMF, remote.Audio.Payload))
 	m.mu.Lock()
 	if m.stopped {
@@ -175,6 +202,8 @@ func (m *Media) Retarget(remote RemoteMedia) error {
 		m.rtpLatch.retarget(rtpAddr)
 		m.rtcpLatch.retarget(rtcpAddr)
 		m.recv.reset()
+		m.play.reset()
+		m.clearPipe()
 		return nil
 	}
 	m.rtcpLatch.retargetIfUnmoved(rtcpAddr)
@@ -299,11 +328,63 @@ func (m *Media) readRTP() {
 			}
 			continue
 		}
-		acc := m.rtpLatch.observe(buf[:n], addr, time.Now())
-		if !acc.ok {
-			continue
+		m.takeRTP(buf[:n], addr, time.Now())
+	}
+}
+
+func (m *Media) takeRTP(b []byte, addr *net.UDPAddr, now time.Time) {
+	before := m.rtpLatch.dest()
+	acc := m.rtpLatch.observe(b, addr, now)
+	if !acc.ok {
+		return
+	}
+	if !sameAddr(before, m.rtpLatch.dest()) {
+		// The first packet moves SDPTarget to the peer. The ring is empty
+		// then, so reception state from an earlier RTCP report stays.
+		// A later latch switch discards audio that belonged to the old address.
+		if m.play.reset() {
+			m.recv.reset()
 		}
-		m.recv.note(acc.ssrc, uint32(acc.seq), acc.ts, time.Now(), acc.audio)
+		m.clearPipe()
+	}
+	m.ingest(acc, now)
+}
+
+func (m *Media) ingest(acc rtpAccept, now time.Time) {
+	if acc.audio {
+		pcm, err := decodePayload(m.send.codecName(), acc.payload)
+		if err != nil || (len(pcm) != frameBytes && len(pcm) != frameBytes/2) {
+			m.play.count(acc.ssrc, acc.seq)
+		} else {
+			m.play.pushAudio(acc.ssrc, acc.seq, pcm, now)
+		}
+	} else {
+		m.play.pushEvent(acc.ssrc, acc.seq, now)
+	}
+	m.recv.note(acc.ssrc, uint32(acc.seq), acc.ts, now, acc.audio)
+}
+
+func (m *Media) playLoop() {
+	defer m.wg.Done()
+	ticker := time.NewTicker(tickInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-m.stop:
+			m.play.shutdown()
+			return
+		case now := <-ticker.C:
+			m.play.step(now)
+		}
+	}
+}
+
+func (m *Media) clearPipe() {
+	m.mu.Lock()
+	p := m.pipe
+	m.mu.Unlock()
+	if p != nil {
+		p.Clear()
 	}
 }
 
@@ -388,6 +469,7 @@ type mediaParams struct {
 	allow    []net.IP
 	interval time.Duration
 	cname    string
+	jitter   JitterConfig
 }
 
 func (e *Endpoint) mediaParams() (mediaParams, error) {
@@ -409,6 +491,7 @@ func (e *Endpoint) mediaParams() (mediaParams, error) {
 		allow:    allow,
 		interval: interval,
 		cname:    e.cfg.User + "@" + e.cfg.Domain,
+		jitter:   e.cfg.Jitter,
 	}, nil
 }
 

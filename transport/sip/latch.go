@@ -46,11 +46,12 @@ func (s LatchState) String() string {
 }
 
 type rtpAccept struct {
-	ok    bool
-	audio bool
-	seq   uint16
-	ts    uint32
-	ssrc  uint32
+	ok      bool
+	audio   bool
+	seq     uint16
+	ts      uint32
+	ssrc    uint32
+	payload []byte
 }
 
 type rtpSource struct {
@@ -429,11 +430,12 @@ func classifyRTP(b []byte, audioPT uint8, dtmfPT int) (*rtp.Packet, bool, bool) 
 
 func acceptOf(pkt *rtp.Packet, audio bool) rtpAccept {
 	return rtpAccept{
-		ok:    true,
-		audio: audio,
-		seq:   pkt.SequenceNumber,
-		ts:    pkt.Timestamp,
-		ssrc:  pkt.SSRC,
+		ok:      true,
+		audio:   audio,
+		seq:     pkt.SequenceNumber,
+		ts:      pkt.Timestamp,
+		ssrc:    pkt.SSRC,
+		payload: append([]byte(nil), pkt.Payload...),
 	}
 }
 
