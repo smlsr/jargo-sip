@@ -79,7 +79,7 @@ func (r recognizer) Transcribe(ctx context.Context, audio []byte, sampleRate int
 	if err != nil {
 		return "", err
 	}
-	body, err := asrBody(wav)
+	body, err := asrBody(wav, r.model)
 	if err != nil {
 		return "", err
 	}
@@ -246,7 +246,7 @@ func voiceRejected(err error) bool {
 	return ok && se.code == http.StatusBadRequest && strings.Contains(strings.ToLower(se.body), "voice")
 }
 
-func asrBody(wav []byte) ([]byte, error) {
+func asrBody(wav []byte, model string) ([]byte, error) {
 	return json.Marshal(map[string]any{
 		"contents": []any{map[string]any{
 			"role": "user",
@@ -261,7 +261,7 @@ func asrBody(wav []byte) ([]byte, error) {
 		"generationConfig": map[string]any{
 			"temperature":     0,
 			"maxOutputTokens": 200,
-			"thinkingConfig":  map[string]any{"thinkingLevel": "minimal"},
+			"thinkingConfig":  recognitionThinking(model),
 		},
 	})
 }

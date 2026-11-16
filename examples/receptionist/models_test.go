@@ -54,6 +54,50 @@ func TestSelectDialogModelFlash35Lite(t *testing.T) {
 	}
 }
 
+func TestRecognitionThinking(t *testing.T) {
+	cases := []struct {
+		model string
+		key   string
+		value any
+	}{
+		{"gemini-3.5-flash", "thinkingLevel", "minimal"},
+		{"models/gemini-3.5-flash", "thinkingLevel", "minimal"},
+		{"gemini-3.5-flash-lite", "thinkingLevel", "minimal"},
+		{"gemini-3.6-flash", "thinkingLevel", "minimal"},
+		{"gemini-3.7-flash", "thinkingLevel", "low"},
+		{"gemini-3.8-flash", "thinkingLevel", "low"},
+		{"models/gemini-3.8-flash", "thinkingLevel", "low"},
+		{"gemini-3.8-flash-lite", "thinkingLevel", "minimal"},
+		{"gemini-4-flash", "thinkingLevel", "low"},
+		{"gemini-flash-latest", "thinkingLevel", "low"},
+		{"gemini-2.5-flash", "thinkingBudget", 0},
+	}
+	for _, tc := range cases {
+		got := recognitionThinking(tc.model)
+		if got[tc.key] != tc.value || len(got) != 1 {
+			t.Errorf("%s thinking %v", tc.model, got)
+		}
+	}
+}
+
+func TestASRBodyUsesTheModelsThinkingLevel(t *testing.T) {
+	flash35, err := asrBody([]byte{0, 0}, "gemini-3.5-flash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(flash35), `"thinkingLevel":"minimal"`) {
+		t.Fatalf("3.5 body %s", flash35)
+	}
+	flash38, err := asrBody([]byte{0, 0}, "gemini-3.8-flash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(flash38)
+	if !strings.Contains(text, `"thinkingLevel":"low"`) || strings.Contains(text, "minimal") {
+		t.Fatalf("3.8 body %s", text)
+	}
+}
+
 func TestSelectDialogModelEmpty(t *testing.T) {
 	if _, err := selectDialogModel([]string{"models/gemini-3.8-flash-tts"}); err == nil {
 		t.Fatal("expected an error")

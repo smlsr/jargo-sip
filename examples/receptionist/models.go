@@ -52,6 +52,25 @@ func selectDialogModel(names []string) (string, error) {
 	return best.id, nil
 }
 
+// recognitionThinking is the lowest thinking setting a dialog model accepts.
+// Gemini 3.5 Flash accepts "minimal". Gemini 3.7 Flash and Gemini 3.8 Flash
+// reject "minimal" and accept "low", as do later numbered flashes. Gemini 2.5
+// takes a budget, and 0 turns thinking off. An alias can move onto a model
+// that rejects "minimal", so it is sent "low".
+func recognitionThinking(model string) map[string]any {
+	f, ok := parseFlash(model)
+	if !ok || f.alias {
+		return map[string]any{"thinkingLevel": "low"}
+	}
+	if f.major < 3 {
+		return map[string]any{"thinkingBudget": 0}
+	}
+	if !f.lite && (f.major > 3 || f.minor >= 7) {
+		return map[string]any{"thinkingLevel": "low"}
+	}
+	return map[string]any{"thinkingLevel": "minimal"}
+}
+
 type flashModel struct {
 	id      string
 	major   int
